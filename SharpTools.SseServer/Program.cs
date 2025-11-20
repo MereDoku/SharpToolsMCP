@@ -3,7 +3,6 @@ using SharpTools.Tools.Interfaces;
 using SharpTools.Tools.Mcp.Tools;
 using SharpTools.Tools.Extensions;
 using System.CommandLine;
-using System.CommandLine.Builder;
 using System.CommandLine.Parsing;
 using Microsoft.AspNetCore.HttpLogging;
 using Serilog;
@@ -15,7 +14,6 @@ using SharpTools.Tools.Services;
 using SharpTools.Tools.Interfaces;
 using SharpTools.Tools.Mcp.Tools;
 using System.CommandLine;
-using System.CommandLine.Builder;
 using System.CommandLine.Parsing;
 using Microsoft.AspNetCore.HttpLogging;
 using Serilog;
@@ -33,60 +31,54 @@ public class Program {
         _ = typeof(AnalysisTools);
         _ = typeof(ModificationTools);
 
-        var portOption = new Option<int>(
-            name: "--port",
-            description: "The port number for the MCP server to listen on.",
-            getDefaultValue: () => 3001);
+        var portOption = new Option<int>("--port") {
+            Description = "The port number for the MCP server to listen on.",
+            DefaultValueFactory = x => 3001
+        };
 
-        var logFileOption = new Option<string?>(
-            name: "--log-file",
-            description: "Optional path to a log file. If not specified, logs only go to console.");
+        var logFileOption = new Option<string?>("--log-file") {
+            Description = "Optional path to a log file. If not specified, logs only go to console."
+        };
 
-        var logLevelOption = new Option<Serilog.Events.LogEventLevel>(
-            name: "--log-level",
-            description: "Minimum log level for console and file.",
-            getDefaultValue: () => Serilog.Events.LogEventLevel.Information);
+        var logLevelOption = new Option<Serilog.Events.LogEventLevel>("--log-level") {
+            Description = "Minimum log level for console and file.",
+            DefaultValueFactory = x => Serilog.Events.LogEventLevel.Information
+        };
 
-        var loadSolutionOption = new Option<string?>(
-            name: "--load-solution",
-            description: "Path to a solution file (.sln) to load immediately on startup.");
+        var loadSolutionOption = new Option<string?>("--load-solution") {
+            Description = "Path to a solution file (.sln) to load immediately on startup."
+        };
 
-        var buildConfigurationOption = new Option<string?>(
-            name: "--build-configuration",
-            description: "Build configuration to use when loading the solution (Debug, Release, etc.).");
+        var buildConfigurationOption = new Option<string?>("--build-configuration") {
+            Description = "Build configuration to use when loading the solution (Debug, Release, etc.)."
+        };
 
-        var disableGitOption = new Option<bool>(
-            name: "--disable-git",
-            description: "Disable Git integration.",
-            getDefaultValue: () => false);
+        var disableGitOption = new Option<bool>("--disable-git") {
+            Description = "Disable Git integration.",
+            DefaultValueFactory = x => false
+        };
 
         var rootCommand = new RootCommand("SharpTools MCP Server") {
-        portOption,
-        logFileOption,
-        logLevelOption,
-        loadSolutionOption,
-        buildConfigurationOption,
-        disableGitOption
-    };
+            portOption,
+            logFileOption,
+            logLevelOption,
+            loadSolutionOption,
+            buildConfigurationOption,
+            disableGitOption
+        };
 
-        ParseResult? parseResult = null;
-        rootCommand.SetHandler((invocationContext) => {
-            parseResult = invocationContext.ParseResult;
-        });
-
-        await rootCommand.InvokeAsync(args);
-
+        ParseResult? parseResult = rootCommand.Parse(args);
         if (parseResult == null) {
             Console.Error.WriteLine("Failed to parse command line arguments.");
             return 1;
         }
 
-        int port = parseResult.GetValueForOption(portOption);
-        string? logFilePath = parseResult.GetValueForOption(logFileOption);
-        Serilog.Events.LogEventLevel minimumLogLevel = parseResult.GetValueForOption(logLevelOption);
-        string? solutionPath = parseResult.GetValueForOption(loadSolutionOption);
-        string? buildConfiguration = parseResult.GetValueForOption(buildConfigurationOption)!;
-        bool disableGit = parseResult.GetValueForOption(disableGitOption);
+        int port = parseResult.GetValue(portOption);
+        string? logFilePath = parseResult.GetValue(logFileOption);
+        Serilog.Events.LogEventLevel minimumLogLevel = parseResult.GetValue(logLevelOption);
+        string? solutionPath = parseResult.GetValue(loadSolutionOption);
+        string? buildConfiguration = parseResult.GetValue(buildConfigurationOption)!;
+        bool disableGit = parseResult.GetValue(disableGitOption);
         string serverUrl = $"http://localhost:{port}";
 
         var loggerConfiguration = new LoggerConfiguration()

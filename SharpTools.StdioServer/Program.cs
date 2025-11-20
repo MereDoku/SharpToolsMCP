@@ -26,54 +26,47 @@ public static class Program {
         _ = typeof(AnalysisTools);
         _ = typeof(ModificationTools);
 
-        var logDirOption = new Option<string?>(
-            name: "--log-directory",
-            description: "Optional path to a log directory. If not specified, logs only go to console.");
+        var logDirOption = new Option<string?>("--log-directory") {
+            Description = "Optional path to a log directory. If not specified, logs only go to console."
+        };
 
-        var logLevelOption = new Option<Serilog.Events.LogEventLevel>(
-            name: "--log-level",
-            description: "Minimum log level for console and file.",
-            getDefaultValue: () => Serilog.Events.LogEventLevel.Information);
+        var logLevelOption = new Option<Serilog.Events.LogEventLevel>("--log-level") {
+            Description = "Minimum log level for console and file.",
+            DefaultValueFactory = x => Serilog.Events.LogEventLevel.Information
+        };
 
-        var loadSolutionOption = new Option<string?>(
-            name: "--load-solution",
-            description: "Path to a solution file (.sln) to load immediately on startup.");
+        var loadSolutionOption = new Option<string?>("--load-solution") {
+            Description = "Path to a solution file (.sln) to load immediately on startup."
+        };
 
-        var buildConfigurationOption = new Option<string?>(
-            name: "--build-configuration",
-            description: "Build configuration to use when loading the solution (Debug, Release, etc.).");
+        var buildConfigurationOption = new Option<string?>("--build-configuration") {
+            Description = "Build configuration to use when loading the solution (Debug, Release, etc.)."
+        };
 
-        var disableGitOption = new Option<bool>(
-            name: "--disable-git",
-            description: "Disable Git integration.",
-            getDefaultValue: () => false);
+        var disableGitOption = new Option<bool>("--disable-git") {
+            Description = "Disable Git integration.",
+            DefaultValueFactory = x => false
+        };
 
-        var rootCommand = new RootCommand("SharpTools MCP StdIO Server")
-        {
-        logDirOption,
-        logLevelOption,
-        loadSolutionOption,
-        buildConfigurationOption,
-        disableGitOption
-    };
+        var rootCommand = new RootCommand("SharpTools MCP StdIO Server"){
+            logDirOption,
+            logLevelOption,
+            loadSolutionOption,
+            buildConfigurationOption,
+            disableGitOption
+        };
 
-        ParseResult? parseResult = null;
-        rootCommand.SetHandler((invocationContext) => {
-            parseResult = invocationContext.ParseResult;
-        });
-
-        await rootCommand.InvokeAsync(args);
-
+        ParseResult? parseResult = rootCommand.Parse(args);
         if (parseResult == null) {
             Console.Error.WriteLine("Failed to parse command line arguments.");
             return 1;
         }
 
-        string? logDirPath = parseResult.GetValueForOption(logDirOption);
-        Serilog.Events.LogEventLevel minimumLogLevel = parseResult.GetValueForOption(logLevelOption);
-        string? solutionPath = parseResult.GetValueForOption(loadSolutionOption);
-        string? buildConfiguration = parseResult.GetValueForOption(buildConfigurationOption)!;
-        bool disableGit = parseResult.GetValueForOption(disableGitOption);
+        string? logDirPath = parseResult.GetValue(logDirOption);
+        Serilog.Events.LogEventLevel minimumLogLevel = parseResult.GetValue(logLevelOption);
+        string? solutionPath = parseResult.GetValue(loadSolutionOption);
+        string? buildConfiguration = parseResult.GetValue(buildConfigurationOption)!;
+        bool disableGit = parseResult.GetValue(disableGitOption);
 
         var loggerConfiguration = new LoggerConfiguration()
             .MinimumLevel.Is(minimumLogLevel)

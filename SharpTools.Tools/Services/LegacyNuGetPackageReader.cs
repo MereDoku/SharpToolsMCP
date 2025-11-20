@@ -4,7 +4,6 @@ using System.IO;
 using System.Linq;
 using System.Xml;
 using System.Xml.Linq;
-using Microsoft.Build.Evaluation;
 
 namespace SharpTools.Tools.Services;
 

@@ -35,9 +35,18 @@ public class ComplexityAnalysisService : IComplexityAnalysisService {
             return;
         }
 
-        var methodNode = await syntaxRef.GetSyntaxAsync(cancellationToken) as MethodDeclarationSyntax;
-        if (methodNode == null) {
-            _logger.LogWarning("Could not get method syntax for {Method}", methodSymbol.Name);
+        var methodNode = await syntaxRef.GetSyntaxAsync(cancellationToken);
+
+        // Ignore constructors
+        if (methodSymbol.MethodKind == MethodKind.Constructor) {
+            return;
+        }
+
+        if (methodNode is not (BaseMethodDeclarationSyntax or AccessorDeclarationSyntax)) {
+            _logger.LogWarning(
+                "Could not get method syntax for {Method}",
+                methodSymbol.Name
+            );
             return;
         }
 
@@ -124,9 +133,8 @@ public class ComplexityAnalysisService : IComplexityAnalysisService {
         // Check if solution is available before using it
         int methodCallCount = 0;
         if (_solutionManager.CurrentSolution != null) {
-            var compilation = await _solutionManager.GetCompilationAsync(
-                methodNode.SyntaxTree.GetRequiredProject(_solutionManager.CurrentSolution).Id,
-                cancellationToken);
+            var project = _solutionManager.CurrentSolution.GetRequiredProjectForSymbol(methodSymbol);
+            var compilation = await _solutionManager.GetCompilationAsync(project.Id, cancellationToken);
 
             if (compilation != null) {
                 var semanticModel = compilation.GetSemanticModel(methodNode.SyntaxTree);
@@ -210,15 +218,23 @@ public class ComplexityAnalysisService : IComplexityAnalysisService {
         foreach (var member in members.OfType<IMethodSymbol>()) {
             if (member.IsImplicitlyDeclared) continue;
 
-            var methodDict = new Dictionary<string, object>();
-            await AnalyzeMethodAsync(member, methodDict, recommendations, cancellationToken);
-
-            if (methodDict.ContainsKey("cyclomaticComplexity")) {
-                methodComplexitySum += (int)methodDict["cyclomaticComplexity"];
-                methodCount++;
+            // Skip property/event accessors and other special-name compiler constructs
+            if (member.MethodKind is MethodKind.PropertyGet or MethodKind.PropertySet
+                or MethodKind.EventAdd or MethodKind.EventRemove
+                or MethodKind.EventRaise) {
+                continue;
             }
 
-            methodMetrics.Add(methodDict);
+            var methodDict = new Dictionary<string, object>();
+            await AnalyzeMethodAsync(member, methodDict, recommendations, cancellationToken);
+            if (methodDict.Count > 0) {
+                if (methodDict.ContainsKey("cyclomaticComplexity")) {
+                    methodComplexitySum += (int)methodDict["cyclomaticComplexity"];
+                    methodCount++;
+                }
+
+                methodMetrics.Add(methodDict);
+            }
         }
 
         typeMetrics["methods"] = methodMetrics;
@@ -232,7 +248,7 @@ public class ComplexityAnalysisService : IComplexityAnalysisService {
         if (_solutionManager.CurrentSolution != null) {
             foreach (var syntaxRef in syntaxRefs) {
                 var syntax = await syntaxRef.GetSyntaxAsync(cancellationToken);
-                var project = syntax.SyntaxTree.GetRequiredProject(_solutionManager.CurrentSolution);
+                var project = _solutionManager.CurrentSolution.GetRequiredProjectForSymbol(typeSymbol);
                 var compilation = await _solutionManager.GetCompilationAsync(project.Id, cancellationToken);
 
                 if (compilation != null) {

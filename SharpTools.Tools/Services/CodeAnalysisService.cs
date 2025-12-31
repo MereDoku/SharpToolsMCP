@@ -62,10 +62,21 @@ public class CodeAnalysisService : ICodeAnalysisService {
 
         var currentSolution = GetCurrentSolutionOrThrow();
         foreach (var syntaxRef in methodSymbol.DeclaringSyntaxReferences) {
-            var methodNode = await syntaxRef.GetSyntaxAsync(cancellationToken) as MethodDeclarationSyntax;
-            if (methodNode?.Body == null && methodNode?.ExpressionBody == null) {
+            var methodNode = await syntaxRef.GetSyntaxAsync(cancellationToken);
+
+            // Ignore constructors
+            if (methodSymbol.MethodKind == MethodKind.Constructor) {
                 continue;
             }
+
+            if (methodNode is not (BaseMethodDeclarationSyntax or AccessorDeclarationSyntax)) {
+                _logger.LogWarning(
+                    "Could not get method syntax for {Method}",
+                    methodSymbol.Name
+                );
+                continue;
+            }
+
 
             var document = currentSolution.GetDocument(syntaxRef.SyntaxTree);
             if (document == null) {

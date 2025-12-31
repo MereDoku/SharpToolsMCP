@@ -122,9 +122,31 @@ public class LegacyNuGetPackageReader {
     /// Gets PackageReference items from modern SDK-style projects
     /// </summary>
     public static List<PackageReference> GetPackageReferences(string projectPath) {
-        // Use XML parsing approach instead of MSBuild API
-        return GetBasicPackageReferencesWithoutMSBuild(projectPath);
+        try {
+            // 1) Parse csproj PackageReference (version may be empty)
+            var baseRefs = GetBasicPackageReferencesWithoutMSBuild(projectPath);
+
+            // 2) Enrich with central versions from Directory.Packages.props
+            // CentralPackageVersionResolver returns its own model, so we map back
+            var enriched = CentralPackageVersionResolver
+                .GetPackageReferencesWithCentralVersions(projectPath);
+
+            // If enriched returns something, use it; otherwise fall back
+            if (enriched != null && enriched.Count > 0) {
+                return enriched.Select(p => new PackageReference {
+                    PackageId = p.PackageId,
+                    Version = p.Version,
+                    Format = PackageFormat.PackageReference
+                }).ToList();
+            }
+
+            return baseRefs;
+        } catch {
+            // fallback to old behavior
+            return GetBasicPackageReferencesWithoutMSBuild(projectPath);
+        }
     }
+
 
     /// <summary>
     /// Gets package information from packages.config file

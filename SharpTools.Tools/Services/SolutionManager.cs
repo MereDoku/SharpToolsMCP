@@ -437,12 +437,36 @@ public sealed class SolutionManager : ISolutionManager {
             _logger.LogWarning("Cannot get project by name: No solution loaded.");
             return null;
         }
-        var project = CurrentSolution?.Projects.FirstOrDefault(p => p.Name.Equals(projectName, StringComparison.OrdinalIgnoreCase));
+
+        var solution = CurrentSolution;
+        if (solution == null)
+            return null;
+
+        // 1. Match sur Project.Name
+        var project = solution.Projects.FirstOrDefault(p =>
+            string.Equals(p.Name, projectName, StringComparison.OrdinalIgnoreCase));
+
+        // 2. Match sur nom du csproj
         if (project == null) {
-            _logger.LogWarning("Project not found: {ProjectName}", projectName);
+            project = solution.Projects.FirstOrDefault(p =>
+                p.FilePath != null &&
+                string.Equals(
+                    Path.GetFileNameWithoutExtension(p.FilePath),
+                    projectName,
+                    StringComparison.OrdinalIgnoreCase));
         }
+
+        if (project == null) {
+            _logger.LogWarning(
+                "Project not found: {ProjectName}. Available projects: {Projects}",
+                projectName,
+                string.Join(", ", solution.Projects.Select(p => p.Name))
+            );
+        }
+
         return project;
     }
+
     public async Task<SemanticModel?> GetSemanticModelAsync(DocumentId documentId, CancellationToken cancellationToken) {
         // Check cancellation at entry point
         cancellationToken.ThrowIfCancellationRequested();

@@ -117,17 +117,6 @@ public sealed class SolutionManager : ISolutionManager {
         PopulateReflectionCache(_assemblyPathsForReflection, cancellationToken);
     }
     private async Task InjectMauiGlobalUsingsAsync(Solution solution, CancellationToken cancellationToken) {
-        string? runtimeIdentifier = _runtimeIdentifier;
-        if (string.IsNullOrWhiteSpace(runtimeIdentifier)) {
-            runtimeIdentifier = GetDefaultRuntimeIdentifier();
-            if (!string.IsNullOrWhiteSpace(runtimeIdentifier)) {
-                _logger.LogInformation("Runtime identifier not provided; using default: {RuntimeIdentifier}", runtimeIdentifier);
-            } else {
-                _logger.LogInformation("Runtime identifier not provided; skipping MAUI global using injection.");
-                return;
-            }
-        }
-
         string configuration = string.IsNullOrWhiteSpace(_buildConfiguration) ? "Debug" : _buildConfiguration;
         var updatedSolution = solution;
         int injectedProjects = 0;
@@ -162,11 +151,19 @@ public sealed class SolutionManager : ISolutionManager {
             if (string.IsNullOrEmpty(projectDir)) {
                 continue;
             }
-
-            var objBaseDir = Path.Combine(projectDir, "obj", configuration, projectTargetFramework, runtimeIdentifier);
-            var globalUsingsPath = FindMauiGlobalUsingsFile(objBaseDir);
+            var objSearchPaths = GetMauiGlobalUsingsSearchPaths(projectDir, configuration, projectTargetFramework);
+            string? globalUsingsPath = null;
+            foreach (var objPath in objSearchPaths) {
+                globalUsingsPath = FindMauiGlobalUsingsFile(objPath);
+                if (!string.IsNullOrEmpty(globalUsingsPath)) {
+                    break;
+                }
+            }
             if (string.IsNullOrEmpty(globalUsingsPath)) {
-                _logger.LogWarning("MAUI global usings file not found for project {ProjectName} under {ObjDir}", project.Name, objBaseDir);
+                _logger.LogWarning(
+                    "MAUI global usings file not found for project {ProjectName} under expected obj paths: {ObjPaths}",
+                    project.Name,
+                    string.Join(", ", objSearchPaths));
                 continue;
             }
 
@@ -187,7 +184,6 @@ public sealed class SolutionManager : ISolutionManager {
                 "obj",
                 configuration,
                 projectTargetFramework,
-                runtimeIdentifier,
                 "SharpTools",
                 "Generated",
                 injectedDocName);
@@ -276,6 +272,27 @@ public sealed class SolutionManager : ISolutionManager {
         }
 
         return null;
+    }
+    private List<string> GetMauiGlobalUsingsSearchPaths(string projectDir, string configuration, string targetFramework) {
+        var paths = new List<string>();
+        var baseObjPath = Path.Combine(projectDir, "obj", configuration, targetFramework);
+        paths.Add(baseObjPath);
+
+        if (targetFramework.Contains("-windows", StringComparison.OrdinalIgnoreCase)) {
+            string? runtimeIdentifier = _runtimeIdentifier;
+            if (string.IsNullOrWhiteSpace(runtimeIdentifier)) {
+                runtimeIdentifier = GetDefaultRuntimeIdentifier();
+                if (!string.IsNullOrWhiteSpace(runtimeIdentifier)) {
+                    _logger.LogInformation("Runtime identifier not provided; using default: {RuntimeIdentifier}", runtimeIdentifier);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(runtimeIdentifier)) {
+                paths.Insert(0, Path.Combine(projectDir, "obj", configuration, targetFramework, runtimeIdentifier));
+            }
+        }
+
+        return paths;
     }
     private static string? GetDefaultRuntimeIdentifier() {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {

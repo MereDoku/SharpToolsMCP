@@ -220,6 +220,13 @@ namespace SharpTools.Tools.Services {
                     var syntaxTree = await document.GetSyntaxTreeAsync(docCt);
                     var semanticModel = await document.GetSemanticModelAsync(docCt);
                     if (syntaxTree == null || semanticModel == null) return;
+                    if (!compilation.ContainsSyntaxTree(syntaxTree)) {
+                        _logger.LogDebug(
+                            "Skipping document {DocumentFilePath}: syntax tree not in compilation.",
+                            document.FilePath
+                        );
+                        return;
+                    }
 
                     var methodDeclarations = syntaxTree.GetRoot(docCt).DescendantNodes().OfType<MethodDeclarationSyntax>();
 

@@ -5,6 +5,7 @@ namespace SharpTools.Tools.Mcp.Tools;
 
 using System.Xml;
 using System.Xml.Linq;
+using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 // Marker class for ILogger<T> category specific to SolutionTools
@@ -41,7 +42,9 @@ public static class SolutionTools {
     IEditorConfigProvider editorConfigProvider,
     ILogger<SolutionToolsLogCategory> logger,
     [Description("The absolute file path to the .sln or .slnx solution file.")] string solutionPath,
-    CancellationToken cancellationToken) {
+    [Description("Optional target framework to load (e.g., net9.0-windows10.0.26100.0).")] string? targetFramework = null,
+    [Description("Optional runtime identifier to load (e.g., win10-x64).")] string? runtimeIdentifier = null,
+    CancellationToken cancellationToken = default) {
 
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
             ErrorHandlingHelpers.ValidateStringParameter(solutionPath, "solutionPath", logger);
@@ -60,8 +63,26 @@ public static class SolutionTools {
                 throw new McpException($"File at path '{solutionPath}' is not a .sln or .slnx file.");
             }
 
+            string? effectiveTargetFramework = null;
+            List<string> inferredTargetFrameworks = new();
+            if (!string.IsNullOrWhiteSpace(targetFramework)) {
+                effectiveTargetFramework = targetFramework;
+            } else {
+                var inferred = InferTargetFrameworkFromSolution(solutionPath, logger);
+                effectiveTargetFramework = inferred.SelectedTargetFramework;
+                inferredTargetFrameworks = inferred.Candidates;
+                if (!string.IsNullOrWhiteSpace(effectiveTargetFramework)) {
+                    logger.LogInformation(
+                        "No target framework specified; using inferred target framework: {TargetFramework}",
+                        effectiveTargetFramework
+                    );
+                } else {
+                    logger.LogInformation("No target framework specified; no inference available.");
+                }
+            }
+
             try {
-                await solutionManager.LoadSolutionAsync(solutionPath, cancellationToken);
+                await solutionManager.LoadSolutionAsync(solutionPath, effectiveTargetFramework, runtimeIdentifier, cancellationToken);
             } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
                 logger.LogError(ex, "Failed to load solution at {SolutionPath}", solutionPath);
                 throw new McpException($"Failed to load solution: {ex.Message}");
@@ -87,13 +108,22 @@ public static class SolutionTools {
             logger.LogInformation(successMessage);
 
             try {
-                return await GetProjectStructure(solutionManager, logger, cancellationToken);
+                return await GetProjectStructure(
+                    solutionManager,
+                    logger,
+                    cancellationToken,
+                    effectiveTargetFramework,
+                    inferredTargetFrameworks,
+                    string.IsNullOrWhiteSpace(targetFramework) ? "inferred" : "explicit");
             } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
                 logger.LogWarning(ex, "Successfully loaded solution but failed to retrieve project structure");
                 // Return basic info instead of detailed structure
                 return ToolHelpers.ToJson(new {
                     solutionName = Path.GetFileName(solutionPath),
                     projectCount,
+                    targetFrameworkUsed = effectiveTargetFramework,
+                    targetFrameworkCandidates = inferredTargetFrameworks,
+                    targetFrameworkSource = string.IsNullOrWhiteSpace(targetFramework) ? "inferred" : "explicit",
                     status = "Solution loaded successfully, but project structure retrieval failed."
                 });
             }
@@ -102,7 +132,10 @@ public static class SolutionTools {
     private static async Task<object> GetProjectStructure(
     ISolutionManager solutionManager,
     ILogger<SolutionToolsLogCategory> logger,
-    CancellationToken cancellationToken) {
+    CancellationToken cancellationToken,
+    string? targetFrameworkUsed,
+    List<string> targetFrameworkCandidates,
+    string targetFrameworkSource) {
 
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
             ToolHelpers.EnsureSolutionLoaded(solutionManager);
@@ -120,6 +153,36 @@ public static class SolutionTools {
                         // Get the actual target framework from the project file
                         if (!string.IsNullOrEmpty(project.FilePath) && File.Exists(project.FilePath)) {
                             targetFramework = ExtractTargetFrameworkFromProjectFile(project.FilePath);
+                        }
+
+                        if (compilation != null) {
+                            var globalUsings = new HashSet<string>(StringComparer.Ordinal);
+                            foreach (var syntaxTree in compilation.SyntaxTrees) {
+                                var root = await syntaxTree.GetRootAsync(cancellationToken);
+                                foreach (var usingDirective in root.DescendantNodes().OfType<UsingDirectiveSyntax>()) {
+                                    var usingText = usingDirective.ToFullString().TrimStart();
+                                    if (!usingText.StartsWith("global using ", StringComparison.Ordinal)) {
+                                        continue;
+                                    }
+                                    var usingName = usingDirective.Name?.ToString();
+                                    if (!string.IsNullOrWhiteSpace(usingName)) {
+                                        globalUsings.Add(usingName);
+                                    }
+                                }
+                            }
+                            bool hasMauiUsing = globalUsings.Any(u => u.StartsWith("Microsoft.Maui", StringComparison.Ordinal));
+                            var mauiRefs = compilation.References
+                                .OfType<PortableExecutableReference>()
+                                .Select(r => r.Display)
+                                .Where(d => !string.IsNullOrEmpty(d) && d.Contains("Microsoft.Maui.Controls", StringComparison.OrdinalIgnoreCase))
+                                .Take(5)
+                                .ToList();
+                            logger.LogInformation(
+                                "Project {ProjectName} compilation global usings: {UsingCount} (has Maui: {HasMaui}). Maui ref samples: {MauiRefs}",
+                                project.Name,
+                                globalUsings.Count,
+                                hasMauiUsing,
+                                mauiRefs.Count > 0 ? string.Join(", ", mauiRefs) : "none");
                         }
 
                         // Get top level namespaces
@@ -263,6 +326,9 @@ public static class SolutionTools {
                 var result = new {
                     solutionName,
                     projects = projectsData.OrderBy(p => ((dynamic)p).name).ToList(),
+                    targetFrameworkUsed,
+                    targetFrameworkCandidates = targetFrameworkCandidates.Count > 0 ? targetFrameworkCandidates : null,
+                    targetFrameworkSource,
                     nextStep = $"Use `{ToolHelpers.SharpToolPrefix}{nameof(LoadProject)}` to get a detailed view of a specific project's structure."
                 };
 
@@ -273,6 +339,228 @@ public static class SolutionTools {
                 throw new McpException($"Failed to retrieve project structure: {ex.Message}");
             }
         }, logger, nameof(GetProjectStructure), cancellationToken);
+    }
+    private static (string? SelectedTargetFramework, List<string> Candidates) InferTargetFrameworkFromSolution(
+        string solutionPath,
+        ILogger<SolutionToolsLogCategory> logger) {
+        try {
+            var solutionDir = Path.GetDirectoryName(solutionPath);
+            if (string.IsNullOrWhiteSpace(solutionDir)) {
+                return (null, new List<string>());
+            }
+
+            if (!File.Exists(solutionPath)) {
+                return (null, new List<string>());
+            }
+
+            var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var projectPath in GetProjectPathsFromSolution(solutionPath)) {
+                var fullProjectPath = Path.Combine(solutionDir, projectPath);
+                if (!File.Exists(fullProjectPath)) {
+                    continue;
+                }
+
+                foreach (var tfm in ExtractTargetFrameworksFromProjectFile(fullProjectPath)) {
+                    candidates.Add(tfm);
+                }
+            }
+
+            var candidateList = candidates.OrderBy(c => c).ToList();
+            var selected = SelectPreferredTargetFramework(candidateList);
+            if (selected == null && candidateList.Count > 0) {
+                selected = candidateList[0];
+            }
+
+            return (selected, candidateList);
+        } catch (Exception ex) {
+            logger.LogWarning(ex, "Failed to infer target framework from solution.");
+            return (null, new List<string>());
+        }
+    }
+    private static IEnumerable<string> GetProjectPathsFromSolution(string solutionPath) {
+        foreach (var line in File.ReadLines(solutionPath)) {
+            if (!line.Contains(".csproj", StringComparison.OrdinalIgnoreCase) &&
+                !line.Contains(".fsproj", StringComparison.OrdinalIgnoreCase) &&
+                !line.Contains(".vbproj", StringComparison.OrdinalIgnoreCase)) {
+                continue;
+            }
+
+            var parts = line.Split(',');
+            if (parts.Length < 2) {
+                continue;
+            }
+
+            var rawPath = parts[1].Trim();
+            if (rawPath.Length >= 2 && rawPath.StartsWith('"') && rawPath.EndsWith('"')) {
+                rawPath = rawPath.Substring(1, rawPath.Length - 2);
+            }
+
+            if (!string.IsNullOrWhiteSpace(rawPath)) {
+                yield return rawPath;
+            }
+        }
+    }
+    private static List<string> ExtractTargetFrameworksFromProjectFile(string projectFilePath) {
+        try {
+            if (!File.Exists(projectFilePath)) {
+                return new List<string>();
+            }
+
+            var xDoc = XDocument.Load(projectFilePath);
+            var frameworks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var propertyGroup in xDoc.Descendants("PropertyGroup")) {
+                foreach (var targetFrameworkElement in propertyGroup.Elements("TargetFramework")) {
+                    var value = targetFrameworkElement.Value.Trim();
+                    if (!string.IsNullOrEmpty(value)) {
+                        AddFrameworkValue(value, projectFilePath, xDoc, frameworks, split: false);
+                    }
+                }
+
+                foreach (var targetFrameworksElement in propertyGroup.Elements("TargetFrameworks")) {
+                    var value = targetFrameworksElement.Value.Trim();
+                    if (!string.IsNullOrEmpty(value)) {
+                        AddFrameworkValue(value, projectFilePath, xDoc, frameworks, split: true);
+                    }
+                }
+            }
+
+            if (frameworks.Count > 0) {
+                return frameworks.OrderBy(f => f).ToList();
+            }
+        } catch {
+            // Ignore parsing errors for inference.
+        }
+
+        return new List<string>();
+    }
+    private static readonly Regex MsBuildPropertyRegex = new Regex(@"\$\(([^)]+)\)", RegexOptions.Compiled);
+    private static void AddFrameworkValue(string value, string projectFilePath, XDocument projectDoc, HashSet<string> frameworks, bool split) {
+        var expanded = ExpandPropertyValue(value, projectFilePath, projectDoc);
+        if (string.IsNullOrWhiteSpace(expanded)) {
+            return;
+        }
+
+        if (split) {
+            foreach (var tfm in expanded.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {
+                if (!string.IsNullOrEmpty(tfm)) {
+                    frameworks.Add(tfm);
+                }
+            }
+            return;
+        }
+
+        frameworks.Add(expanded);
+    }
+    private static string? ExpandPropertyValue(string value, string projectFilePath, XDocument projectDoc) {
+        if (string.IsNullOrWhiteSpace(value)) {
+            return null;
+        }
+
+        if (!value.Contains("$(")) {
+            return value;
+        }
+
+        var expanded = value;
+        var matches = MsBuildPropertyRegex.Matches(value);
+        foreach (Match match in matches) {
+            var propertyName = match.Groups[1].Value.Trim();
+            if (string.IsNullOrWhiteSpace(propertyName)) {
+                continue;
+            }
+
+            var propertyValue = ResolvePropertyValue(projectDoc, projectFilePath, propertyName);
+            if (string.IsNullOrWhiteSpace(propertyValue)) {
+                return null;
+            }
+
+            expanded = expanded.Replace(match.Value, propertyValue);
+        }
+
+        return expanded.Contains("$(") ? null : expanded;
+    }
+    private static string? ResolvePropertyValue(XDocument projectDoc, string projectFilePath, string propertyName) {
+        var value = FindPropertyValue(projectDoc, propertyName);
+        if (!string.IsNullOrWhiteSpace(value) && !value.Contains("$(")) {
+            return value;
+        }
+
+        var projectDir = Path.GetDirectoryName(projectFilePath);
+        if (string.IsNullOrEmpty(projectDir)) {
+            return null;
+        }
+
+        foreach (var propsPath in EnumerateDirectoryBuildProps(projectDir)) {
+            try {
+                var propsDoc = XDocument.Load(propsPath);
+                var propsValue = FindPropertyValue(propsDoc, propertyName);
+                if (!string.IsNullOrWhiteSpace(propsValue) && !propsValue.Contains("$(")) {
+                    return propsValue;
+                }
+            } catch {
+                // Ignore parsing errors while resolving properties.
+            }
+        }
+
+        return null;
+    }
+    private static string? FindPropertyValue(XDocument doc, string propertyName) {
+        foreach (var propertyGroup in doc.Descendants("PropertyGroup")) {
+            var element = propertyGroup.Element(propertyName);
+            if (element != null) {
+                var value = element.Value.Trim();
+                if (!string.IsNullOrEmpty(value)) {
+                    return value;
+                }
+            }
+        }
+
+        return null;
+    }
+    private static IEnumerable<string> EnumerateDirectoryBuildProps(string startDirectory) {
+        var dir = new DirectoryInfo(startDirectory);
+        while (dir != null) {
+            var propsPath = Path.Combine(dir.FullName, "Directory.Build.props");
+            if (File.Exists(propsPath)) {
+                yield return propsPath;
+            }
+
+            var targetsPath = Path.Combine(dir.FullName, "Directory.Build.targets");
+            if (File.Exists(targetsPath)) {
+                yield return targetsPath;
+            }
+
+            dir = dir.Parent;
+        }
+    }
+    private static string? SelectPreferredTargetFramework(List<string> candidates) {
+        if (candidates.Count == 0) {
+            return null;
+        }
+
+        if (OperatingSystem.IsWindows()) {
+            var windows = candidates.Where(c => c.Contains("-windows", StringComparison.OrdinalIgnoreCase)).OrderByDescending(c => c).FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(windows)) {
+                return windows;
+            }
+        }
+
+        if (OperatingSystem.IsMacOS()) {
+            var ios = candidates.Where(c => c.Contains("-ios", StringComparison.OrdinalIgnoreCase)).OrderByDescending(c => c).FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(ios)) {
+                return ios;
+            }
+            var catalyst = candidates.Where(c => c.Contains("-maccatalyst", StringComparison.OrdinalIgnoreCase)).OrderByDescending(c => c).FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(catalyst)) {
+                return catalyst;
+            }
+        }
+
+        var android = candidates.Where(c => c.Contains("-android", StringComparison.OrdinalIgnoreCase)).OrderByDescending(c => c).FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(android)) {
+            return android;
+        }
+
+        return candidates[0];
     }
     public static string ExtractTargetFrameworkFromProjectFile(string projectFilePath) {
         try {

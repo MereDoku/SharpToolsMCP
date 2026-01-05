@@ -20,13 +20,15 @@ public sealed class SolutionManager : ISolutionManager {
     public MSBuildWorkspace? CurrentWorkspace => _workspace;
     public Solution? CurrentSolution => _currentSolution;
     private readonly string? _buildConfiguration;
+    private string? _targetFramework;
+    private string? _runtimeIdentifier;
 
     public SolutionManager(ILogger<SolutionManager> logger, IFuzzyFqnLookupService fuzzyFqnLookupService, string? buildConfiguration = null) {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _fuzzyFqnLookupService = fuzzyFqnLookupService ?? throw new ArgumentNullException(nameof(fuzzyFqnLookupService));
         _buildConfiguration = buildConfiguration;
     }
-    public async Task LoadSolutionAsync(string solutionPath, CancellationToken cancellationToken) {
+    public async Task LoadSolutionAsync(string solutionPath, string? targetFramework, string? runtimeIdentifier, CancellationToken cancellationToken) {
         if (!File.Exists(solutionPath)) {
             _logger.LogError("Solution file not found: {SolutionPath}", solutionPath);
             throw new FileNotFoundException("Solution file not found.", solutionPath);
@@ -41,12 +43,25 @@ public sealed class SolutionManager : ISolutionManager {
             if (!string.IsNullOrEmpty(_buildConfiguration)) {
                 properties.Add("Configuration", _buildConfiguration);
             }
+
+            _targetFramework = NormalizeTargetFramework(targetFramework);
+            if (!string.IsNullOrEmpty(_targetFramework)) {
+                properties.Add("TargetFramework", _targetFramework);
+                _logger.LogInformation("Using target framework override: {TargetFramework}", _targetFramework);
+            }
+
+            _runtimeIdentifier = NormalizeRuntimeIdentifier(runtimeIdentifier);
+            if (!string.IsNullOrEmpty(_runtimeIdentifier)) {
+                properties.Add("RuntimeIdentifier", _runtimeIdentifier);
+                _logger.LogInformation("Using runtime identifier override: {RuntimeIdentifier}", _runtimeIdentifier);
+            }
             
             _workspace = MSBuildWorkspace.Create(properties, MefHostServices.DefaultHost);
             _workspace.WorkspaceFailed += OnWorkspaceFailed;
             _logger.LogInformation("Loading solution: {SolutionPath}", solutionPath);
             _currentSolution = await _workspace.OpenSolutionAsync(solutionPath, new ProgressReporter(_logger), cancellationToken);
             _logger.LogInformation("Solution loaded successfully with {ProjectCount} projects.", _currentSolution.Projects.Count());
+            await InjectMauiGlobalUsingsAsync(_currentSolution, cancellationToken);
             InitializeMetadataContextAndReflectionCache(_currentSolution, cancellationToken);
         } catch (Exception ex) {
             _logger.LogError(ex, "Failed to load solution: {SolutionPath}", solutionPath);
@@ -100,6 +115,178 @@ public sealed class SolutionManager : ISolutionManager {
         cancellationToken.ThrowIfCancellationRequested();
 
         PopulateReflectionCache(_assemblyPathsForReflection, cancellationToken);
+    }
+    private async Task InjectMauiGlobalUsingsAsync(Solution solution, CancellationToken cancellationToken) {
+        string? runtimeIdentifier = _runtimeIdentifier;
+        if (string.IsNullOrWhiteSpace(runtimeIdentifier)) {
+            runtimeIdentifier = GetDefaultRuntimeIdentifier();
+            if (!string.IsNullOrWhiteSpace(runtimeIdentifier)) {
+                _logger.LogInformation("Runtime identifier not provided; using default: {RuntimeIdentifier}", runtimeIdentifier);
+            } else {
+                _logger.LogInformation("Runtime identifier not provided; skipping MAUI global using injection.");
+                return;
+            }
+        }
+
+        string configuration = string.IsNullOrWhiteSpace(_buildConfiguration) ? "Debug" : _buildConfiguration;
+        var updatedSolution = solution;
+        int injectedProjects = 0;
+
+        foreach (var project in solution.Projects) {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (string.IsNullOrEmpty(project.FilePath)) {
+                continue;
+            }
+
+            if (!ProjectUsesMaui(project.FilePath)) {
+                continue;
+            }
+
+            var compilation = await project.GetCompilationAsync(cancellationToken);
+            if (compilation == null) {
+                continue;
+            }
+
+            if (CompilationHasMauiGlobalUsings(compilation)) {
+                continue;
+            }
+
+            string projectTargetFramework = _targetFramework ?? SolutionTools.ExtractTargetFrameworkFromProjectFile(project.FilePath);
+            if (string.IsNullOrWhiteSpace(projectTargetFramework)) {
+                _logger.LogWarning("Could not determine target framework for project {ProjectName}; skipping MAUI global using injection.", project.Name);
+                continue;
+            }
+
+            var projectDir = Path.GetDirectoryName(project.FilePath);
+            if (string.IsNullOrEmpty(projectDir)) {
+                continue;
+            }
+
+            var objBaseDir = Path.Combine(projectDir, "obj", configuration, projectTargetFramework, runtimeIdentifier);
+            var globalUsingsPath = FindMauiGlobalUsingsFile(objBaseDir);
+            if (string.IsNullOrEmpty(globalUsingsPath)) {
+                _logger.LogWarning("MAUI global usings file not found for project {ProjectName} under {ObjDir}", project.Name, objBaseDir);
+                continue;
+            }
+
+            string mauiUsingsContent = await File.ReadAllTextAsync(globalUsingsPath, cancellationToken);
+            var mauiGlobalUsings = ExtractMauiGlobalUsings(mauiUsingsContent);
+            if (mauiGlobalUsings.Count == 0) {
+                _logger.LogWarning("No MAUI global usings found in {GlobalUsingsPath} for project {ProjectName}", globalUsingsPath, project.Name);
+                continue;
+            }
+
+            const string injectedDocName = "SharpTools.Maui.GlobalUsings.g.cs";
+            if (project.Documents.Any(d => d.Name.Equals(injectedDocName, StringComparison.OrdinalIgnoreCase))) {
+                continue;
+            }
+
+            var injectedContent = "// Generated by SharpTools to inject MAUI global usings\n" +
+                string.Join("\n", mauiGlobalUsings) + "\n";
+            var injectedText = SourceText.From(injectedContent, Encoding.UTF8);
+            updatedSolution = updatedSolution.AddDocument(
+                DocumentId.CreateNewId(project.Id),
+                injectedDocName,
+                injectedText,
+                new[] { "SharpTools", "Generated" }
+            );
+
+            injectedProjects++;
+            _logger.LogInformation(
+                "Injected {UsingCount} MAUI global usings into project {ProjectName} from {GlobalUsingsPath}",
+                mauiGlobalUsings.Count,
+                project.Name,
+                globalUsingsPath);
+        }
+
+        if (injectedProjects > 0 && _workspace != null) {
+            if (_workspace.TryApplyChanges(updatedSolution)) {
+                _currentSolution = _workspace.CurrentSolution;
+            } else {
+                _currentSolution = updatedSolution;
+            }
+
+            _compilationCache.Clear();
+            _semanticModelCache.Clear();
+            _logger.LogInformation("MAUI global usings injected into {ProjectCount} project(s).", injectedProjects);
+        }
+    }
+    private static bool ProjectUsesMaui(string projectFilePath) {
+        try {
+            if (!File.Exists(projectFilePath)) {
+                return false;
+            }
+
+            var xDoc = XDocument.Load(projectFilePath);
+            var ns = xDoc.Root?.Name.Namespace ?? XNamespace.None;
+            var useMauiValue = xDoc.Descendants(ns + "UseMaui").FirstOrDefault()?.Value;
+            return string.Equals(useMauiValue?.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+        } catch {
+            return false;
+        }
+    }
+    private static bool CompilationHasMauiGlobalUsings(Compilation compilation) {
+        foreach (var syntaxTree in compilation.SyntaxTrees) {
+            var root = syntaxTree.GetRoot();
+            foreach (var usingDirective in root.DescendantNodes().OfType<UsingDirectiveSyntax>()) {
+                var usingText = usingDirective.ToFullString().TrimStart();
+                if (!usingText.StartsWith("global using ", StringComparison.Ordinal)) {
+                    continue;
+                }
+                var usingName = usingDirective.Name?.ToString();
+                if (!string.IsNullOrWhiteSpace(usingName) &&
+                    usingName.StartsWith("Microsoft.Maui", StringComparison.Ordinal)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    private static string? FindMauiGlobalUsingsFile(string objBaseDir) {
+        if (!Directory.Exists(objBaseDir)) {
+            return null;
+        }
+
+        var candidates = Directory.GetFiles(objBaseDir, "*GlobalUsings.g.cs", SearchOption.AllDirectories);
+        foreach (var candidate in candidates) {
+            try {
+                var text = File.ReadAllText(candidate);
+                if (text.Contains("Microsoft.Maui", StringComparison.Ordinal)) {
+                    return candidate;
+                }
+            } catch {
+                // ignore candidate
+            }
+        }
+
+        return null;
+    }
+    private static string? GetDefaultRuntimeIdentifier() {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
+            return null;
+        }
+
+        return RuntimeInformation.ProcessArchitecture switch {
+            Architecture.Arm64 => "win10-arm64",
+            Architecture.X64 => "win10-x64",
+            Architecture.X86 => "win10-x86",
+            _ => null
+        };
+    }
+    private static List<string> ExtractMauiGlobalUsings(string fileContent) {
+        var results = new List<string>();
+        foreach (var line in fileContent.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries)) {
+            var trimmed = line.Trim();
+            if (!trimmed.StartsWith("global using ", StringComparison.Ordinal)) {
+                continue;
+            }
+            if (!trimmed.Contains("Microsoft.Maui", StringComparison.Ordinal)) {
+                continue;
+            }
+            results.Add(trimmed);
+        }
+        return results;
     }
     private void PopulateReflectionCache(IEnumerable<string> assemblyPathsToInspect, CancellationToken cancellationToken = default) {
         // Check cancellation at entry point
@@ -232,7 +419,7 @@ public sealed class SolutionManager : ISolutionManager {
             _logger.LogWarning("Cannot reload solution: No solution loaded.");
             return;
         }
-        await LoadSolutionAsync(_workspace.CurrentSolution.FilePath!, cancellationToken);
+        await LoadSolutionAsync(_workspace.CurrentSolution.FilePath!, _targetFramework, _runtimeIdentifier, cancellationToken);
         _logger.LogDebug("Current solution state has been refreshed from workspace.");
     }
     private void OnWorkspaceFailed(object? sender, WorkspaceDiagnosticEventArgs e) {
@@ -555,6 +742,25 @@ public sealed class SolutionManager : ISolutionManager {
             _logger.LogTrace("Project Load Progress: {ProjectDisplayName}, Operation: {Operation}, Time: {TimeElapsed}",
             projectDisplay, loadProgress.Operation, loadProgress.ElapsedTime);
         }
+    }
+    private static string? NormalizeTargetFramework(string? targetFramework) {
+        if (string.IsNullOrWhiteSpace(targetFramework)) {
+            return null;
+        }
+
+        var normalized = targetFramework.Trim();
+        if (normalized.Contains(';')) {
+            normalized = normalized.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault();
+        }
+
+        return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
+    }
+    private static string? NormalizeRuntimeIdentifier(string? runtimeIdentifier) {
+        if (string.IsNullOrWhiteSpace(runtimeIdentifier)) {
+            return null;
+        }
+
+        return runtimeIdentifier.Trim();
     }
     private HashSet<string> GetNuGetAssemblyPaths(Solution solution, CancellationToken cancellationToken = default) {
         var nugetAssemblyPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using System.IO;
 using DiffPlex.DiffBuilder;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
@@ -59,6 +60,11 @@ internal static class ContextInjectors {
             .OrderByDescending(d => d.Severity)  // Errors first, then warnings
             .ThenBy(d => d.Location.SourceSpan.Start)
             .ToList();
+            if (IsXamlCodeBehind(document)) {
+                diagnostics = diagnostics
+                    .Where(d => !IsInitializeComponentMissing(d))
+                    .ToList();
+            }
             if (!diagnostics.Any())
                 return (false, string.Empty);
             // Focus specifically on member access errors
@@ -87,6 +93,21 @@ internal static class ContextInjectors {
             document.FilePath ?? "unknown");
             return (false, $"Error checking for compilation errors: {ex.Message}");
         }
+    }
+    private static bool IsXamlCodeBehind(Document document) {
+        if (document.FilePath == null || !document.FilePath.EndsWith(".xaml.cs", StringComparison.OrdinalIgnoreCase)) {
+            return false;
+        }
+
+        var xamlPath = Path.ChangeExtension(document.FilePath, ".xaml");
+        return !string.IsNullOrEmpty(xamlPath) && File.Exists(xamlPath);
+    }
+    private static bool IsInitializeComponentMissing(Diagnostic diagnostic) {
+        if (!string.Equals(diagnostic.Id, "CS0103", StringComparison.OrdinalIgnoreCase)) {
+            return false;
+        }
+
+        return diagnostic.GetMessage().Contains("InitializeComponent", StringComparison.OrdinalIgnoreCase);
     }
     /// <summary>
     /// Creates a pretty diff between old and new code, with whitespace and formatting normalized

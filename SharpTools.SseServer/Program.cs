@@ -8,6 +8,8 @@ using Microsoft.AspNetCore.HttpLogging;
 using Serilog;
 using ModelContextProtocol.Protocol;
 using System.Reflection;
+using Microsoft.Build.Locator;
+using System.IO;
 namespace SharpTools.SseServer;
 
 using SharpTools.Tools.Services;
@@ -53,6 +55,18 @@ public class Program {
             Description = "Build configuration to use when loading the solution (Debug, Release, etc.)."
         };
 
+        var msbuildPathOption = new Option<string?>("--msbuild-path") {
+            Description = "Optional path to MSBuild (directory containing MSBuild.dll)."
+        };
+
+        var runtimeIdentifierOption = new Option<string?>("--runtime-identifier") {
+            Description = "Optional runtime identifier to use when loading the solution (e.g., win10-x64)."
+        };
+
+        var targetFrameworkOption = new Option<string?>("--target-framework") {
+            Description = "Target framework to use when loading the solution (e.g., net9.0-windows10.0.26100.0)."
+        };
+
         var disableGitOption = new Option<bool>("--disable-git") {
             Description = "Disable Git integration.",
             DefaultValueFactory = x => false
@@ -64,6 +78,9 @@ public class Program {
             logLevelOption,
             loadSolutionOption,
             buildConfigurationOption,
+            msbuildPathOption,
+            runtimeIdentifierOption,
+            targetFrameworkOption,
             disableGitOption
         };
 
@@ -78,6 +95,9 @@ public class Program {
         Serilog.Events.LogEventLevel minimumLogLevel = parseResult.GetValue(logLevelOption);
         string? solutionPath = parseResult.GetValue(loadSolutionOption);
         string? buildConfiguration = parseResult.GetValue(buildConfigurationOption)!;
+        string? msbuildPath = parseResult.GetValue(msbuildPathOption);
+        string? runtimeIdentifier = parseResult.GetValue(runtimeIdentifierOption);
+        string? targetFramework = parseResult.GetValue(targetFrameworkOption);
         bool disableGit = parseResult.GetValue(disableGitOption);
         string serverUrl = $"http://localhost:{port}";
 
@@ -115,6 +135,26 @@ public class Program {
         }
 
         Log.Logger = loggerConfiguration.CreateBootstrapLogger();
+        if (!MSBuildLocator.IsRegistered) {
+            if (!string.IsNullOrWhiteSpace(msbuildPath)) {
+                if (!Directory.Exists(msbuildPath)) {
+                    Log.Error("MSBuild path not found: {MSBuildPath}", msbuildPath);
+                    return 1;
+                }
+                MSBuildLocator.RegisterMSBuildPath(msbuildPath);
+                VisualStudioInstance? instance = MSBuildLocator
+                    .QueryVisualStudioInstances()
+                    .FirstOrDefault(vs => string.Equals(vs.MSBuildPath, msbuildPath, StringComparison.OrdinalIgnoreCase));
+                if (instance != null) {
+                    Log.Information("MSBuild registered: {Name} {Version} ({MSBuildPath})", instance.Name, instance.Version, instance.MSBuildPath);
+                } else {
+                    Log.Warning("MSBuild registered from path but instance details are unavailable.");
+                }
+            } else {
+                var instance = MSBuildLocator.RegisterDefaults();
+                Log.Information("MSBuild registered: {Name} {Version} ({MSBuildPath})", instance.Name, instance.Version, instance.MSBuildPath);
+            }
+        }
 
         if (disableGit) {
             Log.Information("Git integration is disabled.");
@@ -122,6 +162,12 @@ public class Program {
 
         if (!string.IsNullOrEmpty(buildConfiguration)) {
             Log.Information("Using build configuration: {BuildConfiguration}", buildConfiguration);
+        }
+        if (!string.IsNullOrEmpty(targetFramework)) {
+            Log.Information("Using target framework: {TargetFramework}", targetFramework);
+        }
+        if (!string.IsNullOrEmpty(runtimeIdentifier)) {
+            Log.Information("Using runtime identifier: {RuntimeIdentifier}", runtimeIdentifier);
         }
 
         try {
@@ -166,7 +212,7 @@ public class Program {
                     var editorConfigProvider = app.Services.GetRequiredService<IEditorConfigProvider>();
 
                     Log.Information("Loading solution: {SolutionPath}", solutionPath);
-                    await solutionManager.LoadSolutionAsync(solutionPath, CancellationToken.None);
+                    await solutionManager.LoadSolutionAsync(solutionPath, targetFramework, runtimeIdentifier, CancellationToken.None);
 
                     var solutionDir = Path.GetDirectoryName(solutionPath);
                     if (!string.IsNullOrEmpty(solutionDir)) {

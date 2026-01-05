@@ -137,6 +137,14 @@ public class ComplexityAnalysisService : IComplexityAnalysisService {
             var compilation = await _solutionManager.GetCompilationAsync(project.Id, cancellationToken);
 
             if (compilation != null) {
+                if (!compilation.ContainsSyntaxTree(methodNode.SyntaxTree)) {
+                    _logger.LogDebug(
+                        "Skipping external dependency analysis for {Method}: syntax tree not in compilation.",
+                        methodSymbol.Name
+                    );
+                    return;
+                }
+
                 var semanticModel = compilation.GetSemanticModel(methodNode.SyntaxTree);
                 var methodCalls = methodNode.DescendantNodes()
                     .OfType<InvocationExpressionSyntax>()

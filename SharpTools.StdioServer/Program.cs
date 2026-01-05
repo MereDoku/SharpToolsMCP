@@ -133,14 +133,7 @@ public static class Program {
                     return 1;
                 }
                 MSBuildLocator.RegisterMSBuildPath(msbuildPath);
-                VisualStudioInstance? instance = MSBuildLocator
-                    .QueryVisualStudioInstances()
-                    .FirstOrDefault(vs => string.Equals(vs.MSBuildPath, msbuildPath, StringComparison.OrdinalIgnoreCase));
-                if (instance != null) {
-                    Log.Information("MSBuild registered: {Name} {Version} ({MSBuildPath})", instance.Name, instance.Version, instance.MSBuildPath);
-                } else {
-                    Log.Warning("MSBuild registered from path but instance details are unavailable.");
-                }
+                Log.Information("MSBuild registered from path: {MSBuildPath}", msbuildPath);
             } else {
                 var instance = MSBuildLocator.RegisterDefaults();
                 Log.Information("MSBuild registered: {Name} {Version} ({MSBuildPath})", instance.Name, instance.Version, instance.MSBuildPath);

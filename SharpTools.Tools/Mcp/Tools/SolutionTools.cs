@@ -166,7 +166,10 @@ public static class SolutionTools {
                                     }
                                     var usingName = usingDirective.Name?.ToString();
                                     if (!string.IsNullOrWhiteSpace(usingName)) {
-                                        globalUsings.Add(usingName);
+                                        var normalizedName = usingName.StartsWith("global::", StringComparison.Ordinal)
+                                            ? usingName.Substring("global::".Length)
+                                            : usingName;
+                                        globalUsings.Add(normalizedName);
                                     }
                                 }
                             }
@@ -177,11 +180,17 @@ public static class SolutionTools {
                                 .Where(d => !string.IsNullOrEmpty(d) && d.Contains("Microsoft.Maui.Controls", StringComparison.OrdinalIgnoreCase))
                                 .Take(5)
                                 .ToList();
+                            var mauiUsingsDetected = globalUsings
+                                .Where(u => u.StartsWith("Microsoft.Maui", StringComparison.Ordinal))
+                                .OrderBy(u => u)
+                                .Take(50)
+                                .ToList();
                             logger.LogInformation(
-                                "Project {ProjectName} compilation global usings: {UsingCount} (has Maui: {HasMaui}). Maui ref samples: {MauiRefs}",
+                                "Project {ProjectName} compilation global usings: {UsingCount} (has Maui: {HasMaui}). Maui usings: {MauiUsings}. Maui ref samples: {MauiRefs}",
                                 project.Name,
                                 globalUsings.Count,
                                 hasMauiUsing,
+                                mauiUsingsDetected.Count > 0 ? string.Join(", ", mauiUsingsDetected) : "none",
                                 mauiRefs.Count > 0 ? string.Join(", ", mauiRefs) : "none");
                         }
 

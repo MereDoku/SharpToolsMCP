@@ -62,6 +62,9 @@ public sealed class SolutionManager : ISolutionManager {
             _currentSolution = await _workspace.OpenSolutionAsync(solutionPath, new ProgressReporter(_logger), cancellationToken);
             _logger.LogInformation("Solution loaded successfully with {ProjectCount} projects.", _currentSolution.Projects.Count());
             await InjectMauiGlobalUsingsAsync(_currentSolution, cancellationToken);
+            if (_currentSolution != null) {
+                await InjectMauiXamlGeneratedSourcesAsync(_currentSolution, cancellationToken);
+            }
             InitializeMetadataContextAndReflectionCache(_currentSolution, cancellationToken);
         } catch (Exception ex) {
             _logger.LogError(ex, "Failed to load solution: {SolutionPath}", solutionPath);
@@ -219,6 +222,89 @@ public sealed class SolutionManager : ISolutionManager {
             _logger.LogInformation("MAUI global usings injected into {ProjectCount} project(s).", injectedProjects);
         }
     }
+    private async Task InjectMauiXamlGeneratedSourcesAsync(Solution solution, CancellationToken cancellationToken) {
+        string configuration = string.IsNullOrWhiteSpace(_buildConfiguration) ? "Debug" : _buildConfiguration;
+        var updatedSolution = solution;
+        int injectedProjects = 0;
+        int injectedDocuments = 0;
+
+        foreach (var project in solution.Projects) {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (string.IsNullOrEmpty(project.FilePath)) {
+                continue;
+            }
+
+            if (!ProjectUsesMaui(project.FilePath)) {
+                continue;
+            }
+
+            string projectTargetFramework = _targetFramework ?? SolutionTools.ExtractTargetFrameworkFromProjectFile(project.FilePath);
+            if (string.IsNullOrWhiteSpace(projectTargetFramework)) {
+                _logger.LogWarning("Could not determine target framework for project {ProjectName}; skipping MAUI XAML injection.", project.Name);
+                continue;
+            }
+
+            var projectDir = Path.GetDirectoryName(project.FilePath);
+            if (string.IsNullOrEmpty(projectDir)) {
+                continue;
+            }
+
+            var objSearchPaths = GetMauiGlobalUsingsSearchPaths(projectDir, configuration, projectTargetFramework);
+            var xamlGeneratedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var objPath in objSearchPaths) {
+                foreach (var candidate in FindMauiXamlGeneratedFiles(objPath)) {
+                    xamlGeneratedFiles.Add(candidate);
+                }
+            }
+
+            if (xamlGeneratedFiles.Count == 0) {
+                continue;
+            }
+
+            int projectInjectedDocuments = 0;
+            foreach (var generatedFile in xamlGeneratedFiles) {
+                if (project.Documents.Any(d => d.FilePath != null &&
+                    string.Equals(d.FilePath, generatedFile, StringComparison.OrdinalIgnoreCase))) {
+                    continue;
+                }
+
+                string generatedContent = await File.ReadAllTextAsync(generatedFile, cancellationToken);
+                var injectedText = SourceText.From(generatedContent, Encoding.UTF8);
+                var injectedDocName = Path.GetFileName(generatedFile);
+                updatedSolution = updatedSolution.AddDocument(
+                    DocumentId.CreateNewId(project.Id),
+                    injectedDocName,
+                    injectedText,
+                    new[] { "SharpTools", "Generated", "MauiXaml" },
+                    filePath: generatedFile
+                );
+
+                injectedDocuments++;
+                projectInjectedDocuments++;
+            }
+
+            if (projectInjectedDocuments > 0) {
+                injectedProjects++;
+                _logger.LogInformation(
+                    "Injected {DocumentCount} MAUI XAML generated document(s) into project {ProjectName}.",
+                    projectInjectedDocuments,
+                    project.Name);
+            }
+        }
+
+        if (injectedDocuments > 0 && _workspace != null) {
+            if (_workspace.TryApplyChanges(updatedSolution)) {
+                _currentSolution = _workspace.CurrentSolution;
+            } else {
+                _currentSolution = updatedSolution;
+            }
+
+            _compilationCache.Clear();
+            _semanticModelCache.Clear();
+            _logger.LogInformation("MAUI XAML generated sources injected into {ProjectCount} project(s).", injectedProjects);
+        }
+    }
     private static bool ProjectUsesMaui(string projectFilePath) {
         try {
             if (!File.Exists(projectFilePath)) {
@@ -272,6 +358,40 @@ public sealed class SolutionManager : ISolutionManager {
         }
 
         return null;
+    }
+    private static IEnumerable<string> FindMauiXamlGeneratedFiles(string objBaseDir) {
+        if (!Directory.Exists(objBaseDir)) {
+            return Enumerable.Empty<string>();
+        }
+
+        var candidates = Directory.GetFiles(objBaseDir, "*.g.cs", SearchOption.AllDirectories);
+        var matched = new List<string>();
+        foreach (var candidate in candidates) {
+            if (candidate.EndsWith(".xaml.g.cs", StringComparison.OrdinalIgnoreCase)) {
+                matched.Add(candidate);
+                continue;
+            }
+
+            if (LooksLikeXamlGeneratedFile(candidate)) {
+                matched.Add(candidate);
+            }
+        }
+
+        return matched;
+    }
+    private static bool LooksLikeXamlGeneratedFile(string filePath) {
+        try {
+            var fileName = Path.GetFileName(filePath);
+            if (!fileName.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase)) {
+                return false;
+            }
+
+            var text = File.ReadAllText(filePath);
+            return text.Contains("InitializeComponent", StringComparison.Ordinal)
+                && (text.Contains("XamlFilePath", StringComparison.Ordinal) || text.Contains("XamlCompilation", StringComparison.Ordinal));
+        } catch {
+            return false;
+        }
     }
     private List<string> GetMauiGlobalUsingsSearchPaths(string projectDir, string configuration, string targetFramework) {
         var paths = new List<string>();
@@ -811,7 +931,7 @@ public sealed class SolutionManager : ISolutionManager {
             }
 
             var packageReferences = LegacyNuGetPackageReader.GetAllPackageReferences(project.FilePath);
-            var projectTargetFramework = SolutionTools.ExtractTargetFrameworkFromProjectFile(project.FilePath);
+            var projectTargetFramework = _targetFramework ?? SolutionTools.ExtractTargetFrameworkFromProjectFile(project.FilePath);
 
             foreach (var package in packageReferences) {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -894,8 +1014,13 @@ public sealed class SolutionManager : ISolutionManager {
         return assemblies;
     }
     private static string[] GetCompatibleFrameworks(string targetFramework) {
-        // Return frameworks in order of compatibility preference
-        return targetFramework.ToLowerInvariant() switch {
+        // Return frameworks in order of compatibility preference.
+        var normalized = targetFramework.ToLowerInvariant();
+        var baseFramework = normalized.Contains('-')
+            ? normalized.Split('-')[0]
+            : normalized;
+
+        var compatible = baseFramework switch {
             "net10.0" => new[] { "net10.0", "net9.0", "net8.0", "net7.0", "net6.0", "net5.0", "netcoreapp3.1", "netcoreapp3.0", "netcoreapp2.1", "netstandard2.1", "netstandard2.0", "netstandard1.6" },
             "net9.0" => new[] { "net9.0", "net8.0", "net7.0", "net6.0", "net5.0", "netcoreapp3.1", "netcoreapp3.0", "netcoreapp2.1", "netstandard2.1", "netstandard2.0", "netstandard1.6" },
             "net8.0" => new[] { "net8.0", "net7.0", "net6.0", "net5.0", "netcoreapp3.1", "netcoreapp3.0", "netcoreapp2.1", "netstandard2.1", "netstandard2.0", "netstandard1.6" },
@@ -909,5 +1034,18 @@ public sealed class SolutionManager : ISolutionManager {
             "netstandard2.0" => new[] { "netstandard2.0", "netstandard1.6" },
             _ => new[] { "net8.0", "net7.0", "net6.0", "net5.0", "netcoreapp3.1", "netcoreapp3.0", "netcoreapp2.1", "netstandard2.1", "netstandard2.0", "netstandard1.6" }
         };
+
+        if (string.Equals(normalized, baseFramework, StringComparison.OrdinalIgnoreCase)) {
+            return compatible;
+        }
+
+        var ordered = new List<string> { normalized };
+        foreach (var tfm in compatible) {
+            if (!ordered.Contains(tfm, StringComparer.OrdinalIgnoreCase)) {
+                ordered.Add(tfm);
+            }
+        }
+
+        return ordered.ToArray();
     }
 }

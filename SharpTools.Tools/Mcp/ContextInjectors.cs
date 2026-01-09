@@ -61,8 +61,10 @@ internal static class ContextInjectors {
             .ThenBy(d => d.Location.SourceSpan.Start)
             .ToList();
             if (IsXamlCodeBehind(document)) {
+                var xamlNames = GetXamlNamedElements(document.FilePath);
                 diagnostics = diagnostics
                     .Where(d => !IsInitializeComponentMissing(d))
+                    .Where(d => !IsMissingXamlMember(d, xamlNames))
                     .ToList();
             }
             if (!diagnostics.Any())
@@ -108,6 +110,56 @@ internal static class ContextInjectors {
         }
 
         return diagnostic.GetMessage().Contains("InitializeComponent", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsMissingXamlMember(Diagnostic diagnostic, HashSet<string> xamlNames) {
+        if (xamlNames.Count == 0) {
+            return false;
+        }
+
+        if (!string.Equals(diagnostic.Id, "CS0103", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(diagnostic.Id, "CS1061", StringComparison.OrdinalIgnoreCase)) {
+            return false;
+        }
+
+        var missingName = GetMissingMemberName(diagnostic.GetMessage());
+        return !string.IsNullOrEmpty(missingName) && xamlNames.Contains(missingName);
+    }
+
+    private static string? GetMissingMemberName(string diagnosticMessage) {
+        if (string.IsNullOrWhiteSpace(diagnosticMessage)) {
+            return null;
+        }
+
+        var matches = Regex.Matches(diagnosticMessage, "['\\\"](?<name>[^'\\\"]+)['\\\"]");
+        if (matches.Count == 0) {
+            return null;
+        }
+
+        return matches[^1].Groups["name"].Value;
+    }
+
+    private static HashSet<string> GetXamlNamedElements(string? codeBehindPath) {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(codeBehindPath)) {
+            return names;
+        }
+
+        var xamlPath = Path.ChangeExtension(codeBehindPath, ".xaml");
+        if (string.IsNullOrWhiteSpace(xamlPath) || !File.Exists(xamlPath)) {
+            return names;
+        }
+
+        var xamlContent = File.ReadAllText(xamlPath);
+        var matches = Regex.Matches(xamlContent, "\\b(?:x:Name|Name)\\s*=\\s*['\\\"](?<name>[^'\\\"]+)['\\\"]");
+        foreach (Match match in matches) {
+            var name = match.Groups["name"].Value;
+            if (!string.IsNullOrWhiteSpace(name)) {
+                names.Add(name);
+            }
+        }
+
+        return names;
     }
     /// <summary>
     /// Creates a pretty diff between old and new code, with whitespace and formatting normalized

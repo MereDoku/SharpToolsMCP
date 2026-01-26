@@ -15,6 +15,7 @@ using System.IO;
 using System;
 using System.Threading.Tasks;
 using System.Threading;
+using SharpTools.Tools.Utilities;
 
 namespace SharpTools.StdioServer;
 
@@ -135,8 +136,29 @@ public static class Program {
                 MSBuildLocator.RegisterMSBuildPath(msbuildPath);
                 Log.Information("MSBuild registered from path: {MSBuildPath}", msbuildPath);
             } else {
-                var instance = MSBuildLocator.RegisterDefaults();
-                Log.Information("MSBuild registered: {Name} {Version} ({MSBuildPath})", instance.Name, instance.Version, instance.MSBuildPath);
+                MsBuildSdkInfo sdkInfo;
+                try {
+                    sdkInfo = MsBuildSdkResolver.ResolveSdkInfo(solutionPath);
+                } catch (Exception ex) {
+                    Log.Error(ex, "Failed to resolve MSBuild SDK.");
+                    return 1;
+                }
+
+                string resolvedSdkPath = sdkInfo.SdkPath;
+                if (!Directory.Exists(resolvedSdkPath)) {
+                    Log.Error("Resolved MSBuild SDK path not found: {MSBuildPath}", resolvedSdkPath);
+                    return 1;
+                }
+
+                MSBuildLocator.RegisterMSBuildPath(resolvedSdkPath);
+                if (sdkInfo.UsedGlobalJson) {
+                    Log.Information("MSBuild registered from global.json: {SdkVersion} ({MSBuildPath})", sdkInfo.SdkVersion, resolvedSdkPath);
+                } else {
+                    if (!string.IsNullOrWhiteSpace(sdkInfo.RequestedVersion)) {
+                        Log.Warning("global.json requested SDK {RequestedVersion} but it is not installed. Falling back to latest.", sdkInfo.RequestedVersion);
+                    }
+                    Log.Information("MSBuild registered from latest SDK: {SdkVersion} ({MSBuildPath})", sdkInfo.SdkVersion, resolvedSdkPath);
+                }
             }
         }
 

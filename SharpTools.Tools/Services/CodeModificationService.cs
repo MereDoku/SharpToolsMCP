@@ -430,9 +430,10 @@ public class CodeModificationService : ICodeModificationService {
 
         var originalSolution = _solutionManager.CurrentSolution ?? throw new InvalidOperationException("Original solution is null before applying changes.");
         var solutionPath = originalSolution.FilePath ?? "";
+        var persistableOriginalSolution = RemoveTransientMauiGeneratedDocuments(originalSolution);
+        var finalSolutionToApply = RemoveTransientMauiGeneratedDocuments(newSolution);
 
-        var solutionChanges = newSolution.GetChanges(originalSolution);
-        var finalSolutionToApply = newSolution;
+        var solutionChanges = finalSolutionToApply.GetChanges(persistableOriginalSolution);
 
         // Collect changed file paths for git operations - include both changed and new documents
         var changedFilePaths = new List<string>();
@@ -469,7 +470,7 @@ public class CodeModificationService : ICodeModificationService {
 
             // Handle removed documents
             foreach (var removedDocumentId in projectChange.GetRemovedDocuments()) {
-                var removedDocument = originalSolution.GetDocument(removedDocumentId);
+                var removedDocument = persistableOriginalSolution.GetDocument(removedDocumentId);
                 if (removedDocument != null && !string.IsNullOrEmpty(removedDocument.FilePath)) {
                     changedFilePaths.Add(removedDocument.FilePath);
                     _logger.LogInformation("Marked removed document for git tracking: {DocumentPath}", removedDocument.FilePath);
@@ -496,6 +497,42 @@ public class CodeModificationService : ICodeModificationService {
             _logger.LogError("Failed to apply changes to the workspace.");
             throw new InvalidOperationException("Failed to apply changes to the workspace. Files might have been modified externally.");
         }
+    }
+    private static Solution RemoveTransientMauiGeneratedDocuments(Solution solution) {
+        var result = solution;
+        foreach (Project project in result.Projects) {
+            var transientDocumentIds = project.Documents
+                .Where(IsTransientMauiGeneratedDocument)
+                .Select(d => d.Id)
+                .ToList();
+            foreach (DocumentId transientDocumentId in transientDocumentIds) {
+                result = result.RemoveDocument(transientDocumentId);
+            }
+        }
+
+        return result;
+    }
+    private static bool IsTransientMauiGeneratedDocument(Document document) {
+        if (document.Folders.Count >= 3
+            && string.Equals(document.Folders[0], "SharpTools", StringComparison.Ordinal)
+            && string.Equals(document.Folders[1], "Generated", StringComparison.Ordinal)
+            && string.Equals(document.Folders[2], "MauiXaml", StringComparison.Ordinal)) {
+            return true;
+        }
+
+        string? filePath = document.FilePath;
+        if (string.IsNullOrWhiteSpace(filePath)) {
+            return false;
+        }
+
+        bool isXamlGenerated = filePath.EndsWith(".xaml.sg.cs", StringComparison.OrdinalIgnoreCase)
+            || filePath.EndsWith(".xaml.g.cs", StringComparison.OrdinalIgnoreCase);
+        if (!isXamlGenerated) {
+            return false;
+        }
+
+        return filePath.IndexOf($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) >= 0
+            || filePath.IndexOf($"{Path.DirectorySeparatorChar}SharpTools{Path.DirectorySeparatorChar}Generated{Path.DirectorySeparatorChar}MauiXaml{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) >= 0;
     }
     private async Task ProcessGitOperationsAsync(string solutionPath, List<string> changedFilePaths, string commitMessage, CancellationToken cancellationToken) {
         if (string.IsNullOrEmpty(solutionPath) || changedFilePaths.Count == 0) {

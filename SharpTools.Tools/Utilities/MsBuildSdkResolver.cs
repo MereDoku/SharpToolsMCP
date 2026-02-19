@@ -37,7 +37,12 @@ public static class MsBuildSdkResolver {
             }
         }
 
-        SdkEntry latestSdk = GetLatestSdk(installedSdks);
+        List<SdkEntry> stableSdks = installedSdks
+            .Where(sdk => !IsPrereleaseVersion(sdk.Version))
+            .ToList();
+        SdkEntry latestSdk = stableSdks.Count > 0
+            ? GetLatestSdk(stableSdks)
+            : GetLatestSdk(installedSdks);
         return new MsBuildSdkInfo(latestSdk.Version, latestSdk.BasePath, false, globalJsonPath, requestedVersion);
     }
 
@@ -183,6 +188,9 @@ public static class MsBuildSdkResolver {
         }
 
         return string.CompareOrdinal(leftKey.Original, rightKey.Original);
+    }
+    private static bool IsPrereleaseVersion(string version) {
+        return version.Contains('-', StringComparison.Ordinal) || version.Contains('+', StringComparison.Ordinal);
     }
 
     private sealed class SdkEntry {

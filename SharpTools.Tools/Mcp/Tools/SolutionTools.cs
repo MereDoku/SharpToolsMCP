@@ -5,6 +5,7 @@ namespace SharpTools.Tools.Mcp.Tools;
 
 using System.Xml;
 using System.Xml.Linq;
+using System.Diagnostics;
 using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
@@ -47,85 +48,150 @@ public static class SolutionTools {
     CancellationToken cancellationToken = default) {
 
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            ErrorHandlingHelpers.ValidateStringParameter(solutionPath, "solutionPath", logger);
-            logger.LogInformation("Executing '{LoadSolution}' tool for path: {SolutionPath}", nameof(LoadSolution), solutionPath);
+            Stopwatch totalStopwatch = Stopwatch.StartNew();
+            string currentPhase = "validation";
+            long loadSolutionAsyncDurationMs = 0;
+            long editorConfigDurationMs = 0;
+            long getProjectStructureDurationMs = 0;
+            string targetFrameworkSource = "explicit";
+            try {
+                ErrorHandlingHelpers.ValidateStringParameter(solutionPath, "solutionPath", logger);
+                logger.LogInformation("Executing '{LoadSolution}' tool for path: {SolutionPath}", nameof(LoadSolution), solutionPath);
 
-            // Validate solution file exists and has correct extension
-            if (!File.Exists(solutionPath)) {
-                logger.LogError("Solution file not found at path: {SolutionPath}", solutionPath);
-                throw new McpException($"Solution file does not exist at path: {solutionPath}");
-            }
-
-            var ext = Path.GetExtension(solutionPath);
-            if (!ext.Equals(".sln", StringComparison.OrdinalIgnoreCase) &&
-                !ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase)) {
-                logger.LogError("File is not a valid solution file: {SolutionPath}", solutionPath);
-                throw new McpException($"File at path '{solutionPath}' is not a .sln or .slnx file.");
-            }
-
-            string? effectiveTargetFramework = null;
-            List<string> inferredTargetFrameworks = new();
-            if (!string.IsNullOrWhiteSpace(targetFramework)) {
-                effectiveTargetFramework = targetFramework;
-            } else {
-                var inferred = InferTargetFrameworkFromSolution(solutionPath, logger);
-                effectiveTargetFramework = inferred.SelectedTargetFramework;
-                inferredTargetFrameworks = inferred.Candidates;
-                if (!string.IsNullOrWhiteSpace(effectiveTargetFramework)) {
-                    logger.LogInformation(
-                        "No target framework specified; using inferred target framework: {TargetFramework}",
-                        effectiveTargetFramework
-                    );
-                } else {
-                    logger.LogInformation("No target framework specified; no inference available.");
+                // Validate solution file exists and has correct extension
+                if (!File.Exists(solutionPath)) {
+                    logger.LogError("Solution file not found at path: {SolutionPath}", solutionPath);
+                    throw new McpException($"Solution file does not exist at path: {solutionPath}");
                 }
-            }
 
-            try {
-                await solutionManager.LoadSolutionAsync(solutionPath, effectiveTargetFramework, runtimeIdentifier, cancellationToken);
-            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                logger.LogError(ex, "Failed to load solution at {SolutionPath}", solutionPath);
-                throw new McpException($"Failed to load solution: {ex.Message}");
-            }
+                var ext = Path.GetExtension(solutionPath);
+                if (!ext.Equals(".sln", StringComparison.OrdinalIgnoreCase) &&
+                    !ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase)) {
+                    logger.LogError("File is not a valid solution file: {SolutionPath}", solutionPath);
+                    throw new McpException($"File at path '{solutionPath}' is not a .sln or .slnx file.");
+                }
 
-            // Get solution directory and initialize editor config
-            var solutionDir = Path.GetDirectoryName(solutionPath);
-            if (string.IsNullOrEmpty(solutionDir)) {
-                logger.LogWarning(".editorconfig provider could not determine solution directory from path: {SolutionPath}", solutionPath);
-                throw new McpException($"Could not determine directory for solution path: {solutionPath}");
-            }
+                string? effectiveTargetFramework = null;
+                List<string> inferredTargetFrameworks = new();
+                if (!string.IsNullOrWhiteSpace(targetFramework)) {
+                    effectiveTargetFramework = targetFramework;
+                    targetFrameworkSource = "explicit";
+                } else {
+                    var inferred = InferTargetFrameworkFromSolution(solutionPath, logger);
+                    effectiveTargetFramework = inferred.SelectedTargetFramework;
+                    inferredTargetFrameworks = inferred.Candidates;
+                    targetFrameworkSource = "inferred";
+                    if (!string.IsNullOrWhiteSpace(effectiveTargetFramework)) {
+                        logger.LogInformation(
+                            "No target framework specified; using inferred target framework: {TargetFramework}",
+                            effectiveTargetFramework
+                        );
+                    } else {
+                        logger.LogInformation("No target framework specified; no inference available.");
+                    }
+                }
 
-            try {
-                await editorConfigProvider.InitializeAsync(solutionDir, cancellationToken);
-            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                // Log but don't fail - editor config is helpful but not critical
-                logger.LogWarning(ex, "Failed to initialize .editorconfig from {SolutionDir}", solutionDir);
-                // Continue execution, don't throw
-            }
+                logger.LogInformation(
+                    "LoadSolution started for {SolutionPath} (TargetFramework={TargetFramework}, TargetFrameworkSource={TargetFrameworkSource}, RuntimeIdentifier={RuntimeIdentifier})",
+                    solutionPath,
+                    string.IsNullOrWhiteSpace(effectiveTargetFramework) ? "auto" : effectiveTargetFramework,
+                    targetFrameworkSource,
+                    string.IsNullOrWhiteSpace(runtimeIdentifier) ? "auto" : runtimeIdentifier);
 
-            var projectCount = solutionManager.GetProjects().Count();
-            var successMessage = $"Solution '{Path.GetFileName(solutionPath)}' loaded successfully with {projectCount} project(s). Caches and .editorconfig initialized.";
-            logger.LogInformation(successMessage);
+                try {
+                    currentPhase = "SolutionManager.LoadSolutionAsync";
+                    Stopwatch loadSolutionAsyncStopwatch = Stopwatch.StartNew();
+                    try {
+                        await solutionManager.LoadSolutionAsync(solutionPath, effectiveTargetFramework, runtimeIdentifier, cancellationToken);
+                    } finally {
+                        loadSolutionAsyncStopwatch.Stop();
+                        loadSolutionAsyncDurationMs = loadSolutionAsyncStopwatch.ElapsedMilliseconds;
+                        logger.LogInformation("Phase '{PhaseName}' completed in {ElapsedMs} ms", currentPhase, loadSolutionAsyncDurationMs);
+                    }
+                } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
+                    logger.LogError(ex, "Failed to load solution at {SolutionPath}", solutionPath);
+                    throw new McpException($"Failed to load solution: {ex.Message}");
+                }
 
-            try {
-                return await GetProjectStructure(
-                    solutionManager,
-                    logger,
-                    cancellationToken,
-                    effectiveTargetFramework,
-                    inferredTargetFrameworks,
-                    string.IsNullOrWhiteSpace(targetFramework) ? "inferred" : "explicit");
-            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                logger.LogWarning(ex, "Successfully loaded solution but failed to retrieve project structure");
-                // Return basic info instead of detailed structure
-                return ToolHelpers.ToJson(new {
-                    solutionName = Path.GetFileName(solutionPath),
-                    projectCount,
-                    targetFrameworkUsed = effectiveTargetFramework,
-                    targetFrameworkCandidates = inferredTargetFrameworks,
-                    targetFrameworkSource = string.IsNullOrWhiteSpace(targetFramework) ? "inferred" : "explicit",
-                    status = "Solution loaded successfully, but project structure retrieval failed."
-                });
+                // Get solution directory and initialize editor config
+                var solutionDir = Path.GetDirectoryName(solutionPath);
+                if (string.IsNullOrEmpty(solutionDir)) {
+                    logger.LogWarning(".editorconfig provider could not determine solution directory from path: {SolutionPath}", solutionPath);
+                    throw new McpException($"Could not determine directory for solution path: {solutionPath}");
+                }
+
+                currentPhase = "IEditorConfigProvider.InitializeAsync";
+                Stopwatch editorConfigStopwatch = Stopwatch.StartNew();
+                try {
+                    await editorConfigProvider.InitializeAsync(solutionDir, cancellationToken);
+                } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
+                    // Log but don't fail - editor config is helpful but not critical
+                    logger.LogWarning(ex, "Failed to initialize .editorconfig from {SolutionDir}", solutionDir);
+                    // Continue execution, don't throw
+                } finally {
+                    editorConfigStopwatch.Stop();
+                    editorConfigDurationMs = editorConfigStopwatch.ElapsedMilliseconds;
+                    logger.LogInformation("Phase '{PhaseName}' completed in {ElapsedMs} ms", currentPhase, editorConfigDurationMs);
+                }
+
+                var projectCount = solutionManager.GetProjects().Count();
+                var successMessage = $"Solution '{Path.GetFileName(solutionPath)}' loaded successfully with {projectCount} project(s). Caches and .editorconfig initialized.";
+                logger.LogInformation(successMessage);
+
+                currentPhase = "GetProjectStructure";
+                Stopwatch getProjectStructureStopwatch = Stopwatch.StartNew();
+                try {
+                    object projectStructureResult = await GetProjectStructure(
+                        solutionManager,
+                        logger,
+                        cancellationToken,
+                        effectiveTargetFramework,
+                        inferredTargetFrameworks,
+                        targetFrameworkSource);
+                    return projectStructureResult;
+                } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
+                    logger.LogWarning(ex, "Successfully loaded solution but failed to retrieve project structure");
+                    // Return basic info instead of detailed structure
+                    return ToolHelpers.ToJson(new {
+                        solutionName = Path.GetFileName(solutionPath),
+                        projectCount,
+                        targetFrameworkUsed = effectiveTargetFramework,
+                        targetFrameworkCandidates = inferredTargetFrameworks,
+                        targetFrameworkSource,
+                        status = "Solution loaded successfully, but project structure retrieval failed."
+                    });
+                } finally {
+                    getProjectStructureStopwatch.Stop();
+                    getProjectStructureDurationMs = getProjectStructureStopwatch.ElapsedMilliseconds;
+                    logger.LogInformation("Phase '{PhaseName}' completed in {ElapsedMs} ms", currentPhase, getProjectStructureDurationMs);
+                    if (getProjectStructureDurationMs > 15_000) {
+                        logger.LogWarning("GetProjectStructure exceeded expected duration: {ElapsedMs} ms", getProjectStructureDurationMs);
+                    }
+                }
+            } catch (OperationCanceledException) {
+                logger.LogWarning(
+                    "LoadSolution cancelled during phase '{PhaseName}' after {ElapsedMs} ms",
+                    currentPhase,
+                    totalStopwatch.ElapsedMilliseconds);
+                throw;
+            } catch (Exception ex) when (!(ex is McpException)) {
+                logger.LogError(
+                    ex,
+                    "LoadSolution failed during phase '{PhaseName}' after {ElapsedMs} ms",
+                    currentPhase,
+                    totalStopwatch.ElapsedMilliseconds);
+                throw;
+            } finally {
+                if (totalStopwatch.IsRunning) {
+                    totalStopwatch.Stop();
+                }
+
+                logger.LogInformation(
+                    "LoadSolution summary: total={TotalMs} ms; loadSolutionAsync={LoadSolutionAsyncMs} ms; editorConfig={EditorConfigMs} ms; getProjectStructure={GetProjectStructureMs} ms",
+                    totalStopwatch.ElapsedMilliseconds,
+                    loadSolutionAsyncDurationMs,
+                    editorConfigDurationMs,
+                    getProjectStructureDurationMs);
             }
         }, logger, nameof(LoadSolution), cancellationToken);
     }
@@ -138,6 +204,7 @@ public static class SolutionTools {
     string targetFrameworkSource) {
 
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            Stopwatch getProjectStructureStopwatch = Stopwatch.StartNew();
             ToolHelpers.EnsureSolutionLoaded(solutionManager);
 
             var projectsData = new List<object>();
@@ -145,9 +212,15 @@ public static class SolutionTools {
             try {
                 foreach (var project in solutionManager.GetProjects()) {
                     cancellationToken.ThrowIfCancellationRequested();
+                    Stopwatch projectStopwatch = Stopwatch.StartNew();
+                    long compilationDurationMs = 0;
+                    long namespaceScanDurationMs = 0;
 
                     try {
+                        Stopwatch compilationStopwatch = Stopwatch.StartNew();
                         var compilation = await solutionManager.GetCompilationAsync(project.Id, cancellationToken);
+                        compilationStopwatch.Stop();
+                        compilationDurationMs = compilationStopwatch.ElapsedMilliseconds;
                         var targetFramework = "Unknown";
 
                         // Get the actual target framework from the project file
@@ -198,6 +271,7 @@ public static class SolutionTools {
                         var topLevelNamespaces = new HashSet<string>();
 
                         try {
+                            Stopwatch namespaceScanStopwatch = Stopwatch.StartNew();
                             foreach (var document in project.Documents) {
                                 if (document.SourceCodeKind != SourceCodeKind.Regular || !document.SupportsSyntaxTree) {
                                     continue;
@@ -216,6 +290,8 @@ public static class SolutionTools {
                                     // Continue with other documents
                                 }
                             }
+                            namespaceScanStopwatch.Stop();
+                            namespaceScanDurationMs = namespaceScanStopwatch.ElapsedMilliseconds;
                         } catch (Exception ex) {
                             logger.LogWarning(ex, "Error getting namespaces for project {ProjectName}", project.Name);
                             // Continue with basic project info
@@ -311,7 +387,16 @@ public static class SolutionTools {
                             projectReferences = projectRefs,
                             packageReferences = packageRefs
                         });
+                        projectStopwatch.Stop();
+                        logger.LogInformation(
+                            "GetProjectStructure project '{ProjectName}' completed in {ElapsedMs} ms (compilation={CompilationMs} ms, namespaceScan={NamespaceScanMs} ms, documents={DocumentCount})",
+                            project.Name,
+                            projectStopwatch.ElapsedMilliseconds,
+                            compilationDurationMs,
+                            namespaceScanDurationMs,
+                            project.DocumentIds.Count);
                     } catch (Exception ex) when (!(ex is OperationCanceledException)) {
+                        projectStopwatch.Stop();
                         logger.LogWarning(ex, "Error processing project {ProjectName}, adding basic info only", project.Name);
                         // Add minimal project info when there's an error
                         projectsData.Add(new {
@@ -321,6 +406,10 @@ public static class SolutionTools {
                             error = $"Error processing project: {ex.Message}",
                             documentCount = project.DocumentIds.Count
                         });
+                        logger.LogWarning(
+                            "GetProjectStructure project '{ProjectName}' failed after {ElapsedMs} ms",
+                            project.Name,
+                            projectStopwatch.ElapsedMilliseconds);
                     }
                 }
 
@@ -342,8 +431,14 @@ public static class SolutionTools {
                 };
 
                 logger.LogInformation("Project structure retrieved successfully for {ProjectCount} projects.", projectsData.Count);
+                getProjectStructureStopwatch.Stop();
+                logger.LogInformation("Phase '{PhaseName}' completed in {ElapsedMs} ms", nameof(GetProjectStructure), getProjectStructureStopwatch.ElapsedMilliseconds);
+                if (getProjectStructureStopwatch.ElapsedMilliseconds > 15_000) {
+                    logger.LogWarning("GetProjectStructure exceeded expected duration: {ElapsedMs} ms", getProjectStructureStopwatch.ElapsedMilliseconds);
+                }
                 return ToolHelpers.ToJson(result);
             } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
+                getProjectStructureStopwatch.Stop();
                 logger.LogError(ex, "Error retrieving project structure");
                 throw new McpException($"Failed to retrieve project structure: {ex.Message}");
             }
@@ -387,6 +482,13 @@ public static class SolutionTools {
         }
     }
     private static IEnumerable<string> GetProjectPathsFromSolution(string solutionPath) {
+        if (Path.GetExtension(solutionPath).Equals(".slnx", StringComparison.OrdinalIgnoreCase)) {
+            foreach (string projectPath in GetProjectPathsFromSlnx(solutionPath)) {
+                yield return projectPath;
+            }
+            yield break;
+        }
+
         foreach (var line in File.ReadLines(solutionPath)) {
             if (!line.Contains(".csproj", StringComparison.OrdinalIgnoreCase) &&
                 !line.Contains(".fsproj", StringComparison.OrdinalIgnoreCase) &&
@@ -409,6 +511,49 @@ public static class SolutionTools {
             }
         }
     }
+    private static IEnumerable<string> GetProjectPathsFromSlnx(string solutionPath) {
+        var resolvedPaths = new List<string>();
+        try {
+            var xDoc = XDocument.Load(solutionPath);
+            var uniquePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var supportedExtensions = new[] { ".csproj", ".fsproj", ".vbproj" };
+
+            foreach (var element in xDoc.Descendants()) {
+                foreach (var attribute in element.Attributes()) {
+                    string value = attribute.Value.Trim();
+                    if (!LooksLikeProjectPath(value, supportedExtensions)) {
+                        continue;
+                    }
+                    if (uniquePaths.Add(value)) {
+                        resolvedPaths.Add(value);
+                    }
+                }
+
+                string elementValue = element.Value?.Trim() ?? string.Empty;
+                if (!LooksLikeProjectPath(elementValue, supportedExtensions)) {
+                    continue;
+                }
+                if (uniquePaths.Add(elementValue)) {
+                    resolvedPaths.Add(elementValue);
+                }
+            }
+        } catch {
+            // Fall through to empty result when .slnx parsing fails.
+        }
+
+        return resolvedPaths;
+    }
+    private static bool LooksLikeProjectPath(string value, string[] supportedExtensions) {
+        if (string.IsNullOrWhiteSpace(value)) {
+            return false;
+        }
+
+        if (value.Contains('\n') || value.Contains('\r')) {
+            return false;
+        }
+
+        return supportedExtensions.Any(ext => value.EndsWith(ext, StringComparison.OrdinalIgnoreCase));
+    }
     private static List<string> ExtractTargetFrameworksFromProjectFile(string projectFilePath) {
         try {
             if (!File.Exists(projectFilePath)) {
@@ -416,16 +561,17 @@ public static class SolutionTools {
             }
 
             var xDoc = XDocument.Load(projectFilePath);
+            var ns = xDoc.Root?.Name.Namespace ?? XNamespace.None;
             var frameworks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var propertyGroup in xDoc.Descendants("PropertyGroup")) {
-                foreach (var targetFrameworkElement in propertyGroup.Elements("TargetFramework")) {
+            foreach (var propertyGroup in xDoc.Descendants(ns + "PropertyGroup")) {
+                foreach (var targetFrameworkElement in propertyGroup.Elements(ns + "TargetFramework")) {
                     var value = targetFrameworkElement.Value.Trim();
                     if (!string.IsNullOrEmpty(value)) {
                         AddFrameworkValue(value, projectFilePath, xDoc, frameworks, split: false);
                     }
                 }
 
-                foreach (var targetFrameworksElement in propertyGroup.Elements("TargetFrameworks")) {
+                foreach (var targetFrameworksElement in propertyGroup.Elements(ns + "TargetFrameworks")) {
                     var value = targetFrameworksElement.Value.Trim();
                     if (!string.IsNullOrEmpty(value)) {
                         AddFrameworkValue(value, projectFilePath, xDoc, frameworks, split: true);
@@ -444,21 +590,40 @@ public static class SolutionTools {
     }
     private static readonly Regex MsBuildPropertyRegex = new Regex(@"\$\(([^)]+)\)", RegexOptions.Compiled);
     private static void AddFrameworkValue(string value, string projectFilePath, XDocument projectDoc, HashSet<string> frameworks, bool split) {
-        var expanded = ExpandPropertyValue(value, projectFilePath, projectDoc);
-        if (string.IsNullOrWhiteSpace(expanded)) {
-            return;
-        }
-
         if (split) {
-            foreach (var tfm in expanded.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {
-                if (!string.IsNullOrEmpty(tfm)) {
-                    frameworks.Add(tfm);
+            var splitValues = value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var splitValue in splitValues) {
+                var expandedSplitValue = ExpandPropertyValue(splitValue, projectFilePath, projectDoc);
+                var candidate = expandedSplitValue ?? splitValue;
+                if (IsValidFrameworkCandidate(candidate)) {
+                    frameworks.Add(candidate);
                 }
             }
             return;
         }
 
-        frameworks.Add(expanded);
+        var expanded = ExpandPropertyValue(value, projectFilePath, projectDoc);
+        var singleCandidate = expanded ?? value;
+        if (IsValidFrameworkCandidate(singleCandidate)) {
+            frameworks.Add(singleCandidate);
+        }
+    }
+    private static bool IsValidFrameworkCandidate(string value) {
+        if (string.IsNullOrWhiteSpace(value)) {
+            return false;
+        }
+
+        if (value.Contains("$(", StringComparison.Ordinal)) {
+            return false;
+        }
+
+        string normalized = value.Trim();
+        if (normalized.Contains(';')) {
+            return false;
+        }
+
+        return normalized.StartsWith("net", StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith(".NET", StringComparison.OrdinalIgnoreCase);
     }
     private static string? ExpandPropertyValue(string value, string projectFilePath, XDocument projectDoc) {
         if (string.IsNullOrWhiteSpace(value)) {
@@ -513,8 +678,9 @@ public static class SolutionTools {
         return null;
     }
     private static string? FindPropertyValue(XDocument doc, string propertyName) {
-        foreach (var propertyGroup in doc.Descendants("PropertyGroup")) {
-            var element = propertyGroup.Element(propertyName);
+        var ns = doc.Root?.Name.Namespace ?? XNamespace.None;
+        foreach (var propertyGroup in doc.Descendants(ns + "PropertyGroup")) {
+            var element = propertyGroup.Element(ns + propertyName);
             if (element != null) {
                 var value = element.Value.Trim();
                 if (!string.IsNullOrEmpty(value)) {
@@ -581,18 +747,29 @@ public static class SolutionTools {
                 return "Unknown";
             }
 
+            var inferredFrameworks = ExtractTargetFrameworksFromProjectFile(projectFilePath);
+            if (inferredFrameworks.Count > 0) {
+                string? preferredFramework = SelectPreferredTargetFramework(inferredFrameworks);
+                if (!string.IsNullOrWhiteSpace(preferredFramework)) {
+                    return preferredFramework;
+                }
+
+                return inferredFrameworks[0];
+            }
+
             var xDoc = XDocument.Load(projectFilePath);
+            var ns = xDoc.Root?.Name.Namespace ?? XNamespace.None;
 
             // New-style .csproj (SDK-style)
-            var propertyGroupElements = xDoc.Descendants("PropertyGroup");
+            var propertyGroupElements = xDoc.Descendants(ns + "PropertyGroup");
             foreach (var propertyGroup in propertyGroupElements) {
-                var targetFrameworkElement = propertyGroup.Element("TargetFramework");
+                var targetFrameworkElement = propertyGroup.Element(ns + "TargetFramework");
                 if (targetFrameworkElement != null) {
                     var value = targetFrameworkElement.Value.Trim();
                     return !string.IsNullOrEmpty(value) ? value : "Unknown";
                 }
 
-                var targetFrameworksElement = propertyGroup.Element("TargetFrameworks");
+                var targetFrameworksElement = propertyGroup.Element(ns + "TargetFrameworks");
                 if (targetFrameworksElement != null) {
                     var value = targetFrameworksElement.Value.Trim();
                     return !string.IsNullOrEmpty(value) ? value : "Unknown";
@@ -600,7 +777,7 @@ public static class SolutionTools {
             }
 
             // Old-style .csproj format
-            var targetFrameworkVersionElement = xDoc.Descendants("TargetFrameworkVersion").FirstOrDefault();
+            var targetFrameworkVersionElement = xDoc.Descendants(ns + "TargetFrameworkVersion").FirstOrDefault();
             if (targetFrameworkVersionElement != null) {
                 var version = targetFrameworkVersionElement.Value.Trim();
 
@@ -614,23 +791,23 @@ public static class SolutionTools {
             }
 
             // Additional old-style property check
-            var targetFrameworkProfile = xDoc.Descendants("TargetFrameworkProfile").FirstOrDefault()?.Value?.Trim();
-            var targetFrameworkIdentifier = xDoc.Descendants("TargetFrameworkIdentifier").FirstOrDefault()?.Value?.Trim();
+            var targetFrameworkProfile = xDoc.Descendants(ns + "TargetFrameworkProfile").FirstOrDefault()?.Value?.Trim();
+            var targetFrameworkIdentifier = xDoc.Descendants(ns + "TargetFrameworkIdentifier").FirstOrDefault()?.Value?.Trim();
 
             if (!string.IsNullOrEmpty(targetFrameworkIdentifier)) {
                 // Parse the old-style framework identifier
                 if (targetFrameworkIdentifier.Contains(".NETFramework")) {
-                    var version = xDoc.Descendants("TargetFrameworkVersion").FirstOrDefault()?.Value?.Trim();
+                    var version = xDoc.Descendants(ns + "TargetFrameworkVersion").FirstOrDefault()?.Value?.Trim();
                     if (!string.IsNullOrEmpty(version) && version.StartsWith("v")) {
                         return $"net{version.Substring(1).Replace(".", "")}";
                     }
                 } else if (targetFrameworkIdentifier.Contains(".NETCore")) {
-                    var version = xDoc.Descendants("TargetFrameworkVersion").FirstOrDefault()?.Value?.Trim();
+                    var version = xDoc.Descendants(ns + "TargetFrameworkVersion").FirstOrDefault()?.Value?.Trim();
                     if (!string.IsNullOrEmpty(version) && version.StartsWith("v")) {
                         return $"netcoreapp{version.Substring(1).Replace(".", "")}";
                     }
                 } else if (targetFrameworkIdentifier.Contains(".NETStandard")) {
-                    var version = xDoc.Descendants("TargetFrameworkVersion").FirstOrDefault()?.Value?.Trim();
+                    var version = xDoc.Descendants(ns + "TargetFrameworkVersion").FirstOrDefault()?.Value?.Trim();
                     if (!string.IsNullOrEmpty(version) && version.StartsWith("v")) {
                         return $"netstandard{version.Substring(1).Replace(".", "")}";
                     }
@@ -670,15 +847,32 @@ public static class SolutionTools {
             logger.LogInformation("Executing '{LoadProjectToolName}' tool for project: {ProjectName}", nameof(LoadProject), projectName);
 
             ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(LoadProject));
-            int indexOfParen = projectName.IndexOf('(');
-            string projectNameNormalized = indexOfParen == -1
-                ? projectName.Trim()
-                : projectName[..indexOfParen].Trim();
+            var allProjects = solutionManager.GetProjects().ToList();
+            var project = allProjects.FirstOrDefault(
+                p => string.Equals(GetProjectDisplayName(p), projectName, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(p.Name, projectName, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(p.AssemblyName, projectName, StringComparison.OrdinalIgnoreCase));
 
-            var project = solutionManager.GetProjects().FirstOrDefault(
-                p => p.Name == projectName
-                || p.AssemblyName == projectName
-                || p.Name == projectNameNormalized);
+            if (project == null) {
+                int indexOfParen = projectName.IndexOf('(');
+                string projectNameNormalized = indexOfParen == -1
+                    ? projectName.Trim()
+                    : projectName[..indexOfParen].Trim();
+
+                var normalizedMatches = allProjects
+                    .Where(p => string.Equals(p.Name, projectNameNormalized, StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(p.AssemblyName, projectNameNormalized, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (normalizedMatches.Count == 1) {
+                    project = normalizedMatches[0];
+                } else if (normalizedMatches.Count > 1) {
+                    string choices = string.Join(", ", normalizedMatches.Select(GetProjectDisplayName));
+                    throw new McpException(
+                        $"Project name '{projectName}' is ambiguous. Use one of: {choices}");
+                }
+            }
+
             if (project == null) {
                 logger.LogError("Project '{ProjectName}' not found in the loaded solution", projectName);
                 throw new McpException($"Project '{projectName}' not found in the solution.");
@@ -828,6 +1022,13 @@ public static class SolutionTools {
                 throw new McpException($"Error analyzing project structure: {ex.Message}");
             }
         }, logger, nameof(LoadProject), cancellationToken);
+    }
+    private static string GetProjectDisplayName(Project project) {
+        if (project.AssemblyName.Equals(project.Name, StringComparison.OrdinalIgnoreCase)) {
+            return project.Name;
+        }
+
+        return $"{project.Name} ({project.AssemblyName})";
     }
     private static Dictionary<string, Dictionary<string, List<INamedTypeSymbol>>> BuildNamespaceHierarchy(
                     List<string> sortedNamespaces,

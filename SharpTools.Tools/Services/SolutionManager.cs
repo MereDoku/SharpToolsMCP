@@ -25,8 +25,10 @@ public sealed class SolutionManager : ISolutionManager {
     private string? _runtimeIdentifier;
     private readonly SemaphoreSlim _loadSolutionSemaphore = new(1, 1);
     private readonly ConcurrentDictionary<string, MauiRefreshAttempt> _mauiRefreshAttemptCache = new(StringComparer.OrdinalIgnoreCase);
+    private IDisposable? _workspaceFailedRegistration;
     private static readonly Regex XamlFilePathAttributeRegex = new(@"XamlFilePath(?:Attribute)?\s*\(\s*@?""(?<path>[^""]+\.xaml)""\s*\)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex XamlFilePathAssignmentRegex = new(@"XamlFilePath\s*=\s*@?""(?<path>[^""]+\.xaml)""", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex CSharpErrorCodeRegex = new(@"error\s+CS(?<code>\d{4})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly TimeSpan MauiRefreshFailureCooldown = TimeSpan.FromMinutes(10);
 
     private sealed record MauiGeneratedSourceCandidate(string FilePath, string Source, string? XamlFilePath);
@@ -121,7 +123,7 @@ public sealed class SolutionManager : ISolutionManager {
                 currentPhase = "open-solution";
                 Stopwatch openSolutionStopwatch = Stopwatch.StartNew();
                 _workspace = MSBuildWorkspace.Create(properties, MefHostServices.DefaultHost);
-                _workspace.WorkspaceFailed += OnWorkspaceFailed;
+                _workspaceFailedRegistration = _workspace.RegisterWorkspaceFailedHandler(OnWorkspaceFailed, options: null);
                 _logger.LogInformation("Loading solution: {SolutionPath}", solutionPath);
                 _currentSolution = await _workspace.OpenSolutionAsync(solutionPath, new ProgressReporter(_logger), cancellationToken);
                 _logger.LogInformation("Solution loaded successfully with {ProjectCount} projects.", _currentSolution.Projects.Count());
@@ -715,9 +717,27 @@ public sealed class SolutionManager : ISolutionManager {
 
         string errorOutput = errorBuilder.ToString().Trim();
         string standardOutput = outputBuilder.ToString().Trim();
-        string details = string.IsNullOrWhiteSpace(errorOutput) ? standardOutput : errorOutput;
+        string details = BuildCombinedProcessOutput(errorOutput, standardOutput);
         if (string.IsNullOrWhiteSpace(details)) {
             details = "No output captured.";
+        }
+
+        if (IsNonFatalMauiRefreshFailure(details)) {
+            int generatedSourceCount = CountAvailableMauiGeneratedSources(projectDir, configuration, targetFramework, generatedOutputPath);
+            if (generatedSourceCount > 0) {
+                string sanitizedDetails = SanitizeMauiRefreshDetailsForLog(details);
+                if (string.IsNullOrWhiteSpace(sanitizedDetails)) {
+                    sanitizedDetails = "Only expected design-time diagnostics were reported and ignored.";
+                }
+
+                _logger.LogInformation(
+                    "MAUI XAML generation build completed with non-fatal diagnostics for {ProjectFilePath} after {ElapsedMilliseconds} ms. Generated source files available: {GeneratedSourceCount}. Details: {Details}",
+                    projectFilePath,
+                    stopwatch.ElapsedMilliseconds,
+                    generatedSourceCount,
+                    TrimForLog(sanitizedDetails, 2000));
+                return (generatedOutputPath, true);
+            }
         }
 
         _logger.LogWarning(
@@ -728,6 +748,105 @@ public sealed class SolutionManager : ISolutionManager {
             TrimForLog(details, 2000));
 
         return (generatedOutputPath, false);
+    }
+    private static string BuildCombinedProcessOutput(string errorOutput, string standardOutput) {
+        if (string.IsNullOrWhiteSpace(errorOutput)) {
+            return standardOutput;
+        }
+
+        if (string.IsNullOrWhiteSpace(standardOutput)) {
+            return errorOutput;
+        }
+
+        return $"{errorOutput}{Environment.NewLine}{standardOutput}";
+    }
+    private static bool IsNonFatalMauiRefreshFailure(string buildOutput) {
+        if (string.IsNullOrWhiteSpace(buildOutput)) {
+            return false;
+        }
+
+        bool hasErrors = false;
+        foreach (string line in buildOutput.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries)) {
+            Match errorMatch = CSharpErrorCodeRegex.Match(line);
+            if (!errorMatch.Success) {
+                continue;
+            }
+
+            hasErrors = true;
+            string code = errorMatch.Groups["code"].Value;
+            if (IsIgnorableMauiRefreshDiagnosticLine(line, code)) {
+                continue;
+            }
+
+            return false;
+        }
+
+        return hasErrors;
+    }
+    private static bool IsIgnorableMauiRefreshDiagnosticLine(string line, string errorCode) {
+        if (string.Equals(errorCode, "5001", StringComparison.Ordinal)) {
+            return true;
+        }
+
+        if (!string.Equals(errorCode, "1061", StringComparison.Ordinal)
+            && !string.Equals(errorCode, "0103", StringComparison.Ordinal)) {
+            return false;
+        }
+
+        bool isInitializeComponentError = line.Contains("InitializeComponent", StringComparison.OrdinalIgnoreCase);
+        bool isWindowsAppCodeBehind = line.Contains(@"Platforms\Windows\App.xaml.cs", StringComparison.OrdinalIgnoreCase);
+        return isInitializeComponentError && isWindowsAppCodeBehind;
+    }
+    private static string SanitizeMauiRefreshDetailsForLog(string details) {
+        if (string.IsNullOrWhiteSpace(details)) {
+            return details;
+        }
+
+        var filteredLines = new List<string>();
+        foreach (string line in details.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)) {
+            Match errorMatch = CSharpErrorCodeRegex.Match(line);
+            if (!errorMatch.Success) {
+                filteredLines.Add(line);
+                continue;
+            }
+
+            string code = errorMatch.Groups["code"].Value;
+            if (IsIgnorableMauiRefreshDiagnosticLine(line, code)) {
+                continue;
+            }
+
+            filteredLines.Add(line);
+        }
+
+        return string.Join(Environment.NewLine, filteredLines).Trim();
+    }
+    private int CountAvailableMauiGeneratedSources(string projectDir, string configuration, string targetFramework, string generatedOutputPath) {
+        var generatedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string filePath in FindMauiXamlGeneratedFiles(generatedOutputPath)) {
+            generatedFiles.Add(filePath);
+        }
+
+        foreach (string rootPath in GetMauiGlobalUsingsSearchPaths(projectDir, configuration, targetFramework)) {
+            foreach (string filePath in FindMauiXamlGeneratedFiles(rootPath)) {
+                generatedFiles.Add(filePath);
+            }
+        }
+
+        foreach (string rootPath in GetMauiCompilerGeneratedSearchPaths(projectDir, configuration, targetFramework)) {
+            foreach (string filePath in FindMauiXamlGeneratedFiles(rootPath)) {
+                generatedFiles.Add(filePath);
+            }
+        }
+
+        string? vsGeneratedDocumentsPath = GetVsGeneratedDocumentsPath();
+        if (!string.IsNullOrWhiteSpace(vsGeneratedDocumentsPath)) {
+            foreach (string filePath in FindMauiXamlGeneratedFiles(vsGeneratedDocumentsPath)) {
+                generatedFiles.Add(filePath);
+            }
+        }
+
+        return generatedFiles.Count;
     }
     private static string TrimForLog(string text, int maxLength) {
         if (string.IsNullOrEmpty(text) || text.Length <= maxLength) {
@@ -997,12 +1116,9 @@ public sealed class SolutionManager : ISolutionManager {
         paths.Add(basePath);
 
         if (targetFramework.Contains("-windows", StringComparison.OrdinalIgnoreCase)) {
-            string? runtimeIdentifier = _runtimeIdentifier;
-            if (string.IsNullOrWhiteSpace(runtimeIdentifier)) {
-                runtimeIdentifier = GetDefaultRuntimeIdentifier();
-            }
-
-            if (!string.IsNullOrWhiteSpace(runtimeIdentifier)) {
+            var runtimeIdentifiers = GetWindowsRuntimeIdentifierCandidates();
+            for (int index = runtimeIdentifiers.Count - 1; index >= 0; index--) {
+                string runtimeIdentifier = runtimeIdentifiers[index];
                 paths.Insert(0, Path.Combine(projectDir, "obj", configuration, targetFramework, runtimeIdentifier, "SharpTools", "CompilerGenerated"));
             }
         }
@@ -1013,6 +1129,12 @@ public sealed class SolutionManager : ISolutionManager {
         List<string> searchPaths = GetMauiCompilerGeneratedSearchPaths(projectDir, configuration, targetFramework);
         if (searchPaths.Count == 0) {
             return Path.Combine(projectDir, "obj", configuration, targetFramework, "SharpTools", "CompilerGenerated");
+        }
+
+        foreach (string path in searchPaths) {
+            if (Directory.Exists(path)) {
+                return path;
+            }
         }
 
         return searchPaths[0];
@@ -1262,20 +1384,55 @@ public sealed class SolutionManager : ISolutionManager {
         paths.Add(baseObjPath);
 
         if (targetFramework.Contains("-windows", StringComparison.OrdinalIgnoreCase)) {
-            string? runtimeIdentifier = _runtimeIdentifier;
-            if (string.IsNullOrWhiteSpace(runtimeIdentifier)) {
-                runtimeIdentifier = GetDefaultRuntimeIdentifier();
-                if (!string.IsNullOrWhiteSpace(runtimeIdentifier)) {
-                    _logger.LogInformation("Runtime identifier not provided; using default: {RuntimeIdentifier}", runtimeIdentifier);
-                }
+            var runtimeIdentifiers = GetWindowsRuntimeIdentifierCandidates();
+            if (string.IsNullOrWhiteSpace(_runtimeIdentifier) && runtimeIdentifiers.Count > 0) {
+                _logger.LogInformation("Runtime identifier not provided; using Windows RID candidates: {RuntimeIdentifiers}", string.Join(", ", runtimeIdentifiers));
             }
 
-            if (!string.IsNullOrWhiteSpace(runtimeIdentifier)) {
+            for (int index = runtimeIdentifiers.Count - 1; index >= 0; index--) {
+                string runtimeIdentifier = runtimeIdentifiers[index];
                 paths.Insert(0, Path.Combine(projectDir, "obj", configuration, targetFramework, runtimeIdentifier));
             }
         }
 
         return paths;
+    }
+    private List<string> GetWindowsRuntimeIdentifierCandidates() {
+        var candidates = new List<string>();
+        var uniqueCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void addCandidate(string? runtimeIdentifier) {
+            if (string.IsNullOrWhiteSpace(runtimeIdentifier)) {
+                return;
+            }
+
+            if (uniqueCandidates.Add(runtimeIdentifier)) {
+                candidates.Add(runtimeIdentifier);
+            }
+
+            string? alternate = GetAlternateWindowsRuntimeIdentifier(runtimeIdentifier);
+            if (!string.IsNullOrWhiteSpace(alternate) && uniqueCandidates.Add(alternate)) {
+                candidates.Add(alternate);
+            }
+        }
+
+        addCandidate(_runtimeIdentifier);
+        if (string.IsNullOrWhiteSpace(_runtimeIdentifier)) {
+            addCandidate(GetDefaultRuntimeIdentifier());
+        }
+
+        return candidates;
+    }
+    private static string? GetAlternateWindowsRuntimeIdentifier(string runtimeIdentifier) {
+        if (runtimeIdentifier.StartsWith("win10-", StringComparison.OrdinalIgnoreCase)) {
+            return "win-" + runtimeIdentifier.Substring("win10-".Length);
+        }
+
+        if (runtimeIdentifier.StartsWith("win-", StringComparison.OrdinalIgnoreCase)) {
+            return "win10-" + runtimeIdentifier.Substring("win-".Length);
+        }
+
+        return null;
     }
     private static string? GetDefaultRuntimeIdentifier() {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
@@ -1283,9 +1440,9 @@ public sealed class SolutionManager : ISolutionManager {
         }
 
         return RuntimeInformation.ProcessArchitecture switch {
-            Architecture.Arm64 => "win10-arm64",
-            Architecture.X64 => "win10-x64",
-            Architecture.X86 => "win10-x86",
+            Architecture.Arm64 => "win-arm64",
+            Architecture.X64 => "win-x64",
+            Architecture.X86 => "win-x86",
             _ => null
         };
     }
@@ -1401,7 +1558,8 @@ public sealed class SolutionManager : ISolutionManager {
         _semanticModelCache.Clear();
         _allLoadedReflectionTypesCache.Clear();
         if (_workspace != null) {
-            _workspace.WorkspaceFailed -= OnWorkspaceFailed;
+            _workspaceFailedRegistration?.Dispose();
+            _workspaceFailedRegistration = null;
             _workspace.CloseSolution();
             _workspace.Dispose();
             _workspace = null;
@@ -1437,7 +1595,7 @@ public sealed class SolutionManager : ISolutionManager {
         await LoadSolutionAsync(_workspace.CurrentSolution.FilePath!, _targetFramework, _runtimeIdentifier, cancellationToken);
         _logger.LogDebug("Current solution state has been refreshed from workspace.");
     }
-    private void OnWorkspaceFailed(object? sender, WorkspaceDiagnosticEventArgs e) {
+    private void OnWorkspaceFailed(WorkspaceDiagnosticEventArgs e) {
         var diagnostic = e.Diagnostic;
         var level = diagnostic.Kind == WorkspaceDiagnosticKind.Failure ? LogLevel.Error : LogLevel.Warning;
         _logger.Log(level, "Workspace diagnostic ({Kind}): {Message}", diagnostic.Kind, diagnostic.Message);

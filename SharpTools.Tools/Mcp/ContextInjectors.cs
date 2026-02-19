@@ -105,7 +105,8 @@ internal static class ContextInjectors {
         return !string.IsNullOrEmpty(xamlPath) && File.Exists(xamlPath);
     }
     private static bool IsInitializeComponentMissing(Diagnostic diagnostic) {
-        if (!string.Equals(diagnostic.Id, "CS0103", StringComparison.OrdinalIgnoreCase)) {
+        if (!string.Equals(diagnostic.Id, "CS0103", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(diagnostic.Id, "CS1061", StringComparison.OrdinalIgnoreCase)) {
             return false;
         }
 

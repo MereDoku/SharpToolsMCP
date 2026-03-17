@@ -195,6 +195,123 @@ public static class SolutionTools {
             }
         }, logger, nameof(LoadSolution), cancellationToken);
     }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(GetDiagnostics), Idempotent = true, Destructive = false, OpenWorld = false, ReadOnly = true)]
+    [Description("Returns structured compiler diagnostics from the loaded solution, a single project, or a single document. Use this to retrieve errors, warnings, or infos directly from Roslyn without running `dotnet build`.")]
+    public static async Task<object> GetDiagnostics(
+        ISolutionManager solutionManager,
+        ILogger<SolutionToolsLogCategory> logger,
+        [Description("Optional project name to restrict results to a single project.")] string? projectName = null,
+        [Description("Optional absolute document path to restrict results to a single source document in the loaded solution.")] string? documentPath = null,
+        [Description("Optional severity filter. Accepted values: `error`, `warning`, `info`, or a comma-separated combination such as `error,warning`.")] string? severity = null,
+        [Description("Optional flag to include diagnostics from transient/generated MAUI XAML files such as `obj\\*.xaml.g.cs` and `obj\\*.xaml.sg.cs`. Defaults to `false`.")] bool includeGeneratedCode = false,
+        [Description("Optional maximum number of diagnostics to return. Must be greater than 0 when specified.")] int? maxResults = null,
+        CancellationToken cancellationToken = default) {
+
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(GetDiagnostics));
+
+            if (maxResults.HasValue && maxResults.Value <= 0) {
+                throw new McpException("Parameter 'maxResults' must be greater than 0 when specified.");
+            }
+
+            Solution solution = solutionManager.CurrentSolution ?? throw new McpException("Current solution is null.");
+            Project? resolvedProject = null;
+            Document? resolvedDocument = null;
+            HashSet<DiagnosticSeverity>? severityFilter = ParseSeverityFilter(severity);
+
+            if (!string.IsNullOrWhiteSpace(projectName)) {
+                resolvedProject = solutionManager.GetProjectByName(projectName)
+                    ?? throw new McpException($"Project '{projectName}' not found in the loaded solution.");
+            }
+
+            if (!string.IsNullOrWhiteSpace(documentPath)) {
+                resolvedDocument = ResolveDocumentFromPath(solution, documentPath!);
+                if (resolvedDocument == null) {
+                    throw new McpException($"Document '{documentPath}' not found in the loaded solution.");
+                }
+
+                if (resolvedProject != null && resolvedDocument.Project.Id != resolvedProject.Id) {
+                    throw new McpException(
+                        $"Document '{documentPath}' does not belong to project '{resolvedProject.Name}'.");
+                }
+
+                resolvedProject ??= resolvedDocument.Project;
+            }
+
+            List<(string ProjectName, Diagnostic Diagnostic)> collectedDiagnostics = new List<(string ProjectName, Diagnostic Diagnostic)>();
+            IEnumerable<Project> projectsToInspect = resolvedProject != null
+                ? new[] { resolvedProject }
+                : solutionManager.GetProjects();
+
+            foreach (Project project in projectsToInspect) {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                Compilation? compilation = await solutionManager.GetCompilationAsync(project.Id, cancellationToken);
+                if (compilation == null) {
+                    if (resolvedProject != null) {
+                        throw new McpException($"Failed to get compilation for project '{project.Name}'.");
+                    }
+
+                    logger.LogWarning("Skipping diagnostics for project {ProjectName} because compilation is unavailable.", project.Name);
+                    continue;
+                }
+
+                IEnumerable<Diagnostic> projectDiagnostics = compilation.GetDiagnostics(cancellationToken);
+                if (resolvedDocument != null) {
+                    string resolvedDocumentPath = Path.GetFullPath(resolvedDocument.FilePath!);
+                    projectDiagnostics = projectDiagnostics.Where(diagnostic =>
+                        diagnostic.Location.IsInSource
+                        && diagnostic.Location.SourceTree?.FilePath != null
+                        && string.Equals(
+                            Path.GetFullPath(diagnostic.Location.SourceTree.FilePath),
+                            resolvedDocumentPath,
+                            StringComparison.OrdinalIgnoreCase));
+                }
+
+                List<Diagnostic> filteredDiagnostics = ContextInjectors.FilterDiagnosticsForAgent(projectDiagnostics, includeGeneratedCode)
+                    .Where(diagnostic => severityFilter == null || severityFilter.Contains(diagnostic.Severity))
+                    .ToList();
+
+                foreach (Diagnostic diagnostic in filteredDiagnostics) {
+                    collectedDiagnostics.Add((project.Name, diagnostic));
+                }
+            }
+
+            List<object> orderedDiagnostics = collectedDiagnostics
+                .OrderByDescending(entry => GetSeverityRank(entry.Diagnostic.Severity))
+                .ThenBy(entry => entry.ProjectName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(entry => entry.Diagnostic.Location.SourceTree?.FilePath ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(entry => entry.Diagnostic.Location.IsInSource ? entry.Diagnostic.Location.GetLineSpan().StartLinePosition.Line : int.MaxValue)
+                .ThenBy(entry => entry.Diagnostic.Location.IsInSource ? entry.Diagnostic.Location.GetLineSpan().StartLinePosition.Character : int.MaxValue)
+                .ThenBy(entry => entry.Diagnostic.Id, StringComparer.OrdinalIgnoreCase)
+                .Select(entry => CreateDiagnosticResult(entry.ProjectName, entry.Diagnostic))
+                .Cast<object>()
+                .ToList();
+
+            int totalCount = orderedDiagnostics.Count;
+            if (maxResults.HasValue) {
+                orderedDiagnostics = orderedDiagnostics.Take(maxResults.Value).ToList();
+            }
+
+            List<string>? severityValues = severityFilter?
+                .Select(MapSeverityToResponseValue)
+                .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            return ToolHelpers.ToJson(new {
+                scope = resolvedDocument != null ? "document" : resolvedProject != null ? "project" : "solution",
+                projectName = resolvedProject?.Name,
+                documentPath = resolvedDocument?.FilePath,
+                severityFilter = severityValues,
+                includeGeneratedCode,
+                totalCount,
+                returnedCount = orderedDiagnostics.Count,
+                truncated = orderedDiagnostics.Count < totalCount,
+                diagnostics = orderedDiagnostics
+            });
+        }, logger, nameof(GetDiagnostics), cancellationToken);
+    }
     private static async Task<object> GetProjectStructure(
     ISolutionManager solutionManager,
     ILogger<SolutionToolsLogCategory> logger,
@@ -1023,6 +1140,88 @@ public static class SolutionTools {
             }
         }, logger, nameof(LoadProject), cancellationToken);
     }
+
+    private static Document? ResolveDocumentFromPath(Solution solution, string documentPath) {
+        string normalizedDocumentPath = Path.GetFullPath(documentPath);
+
+        return solution.Projects
+            .SelectMany(project => project.Documents)
+            .FirstOrDefault(document =>
+                !string.IsNullOrWhiteSpace(document.FilePath)
+                && string.Equals(
+                    Path.GetFullPath(document.FilePath),
+                    normalizedDocumentPath,
+                    StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static HashSet<DiagnosticSeverity>? ParseSeverityFilter(string? severity) {
+        if (string.IsNullOrWhiteSpace(severity)) {
+            return null;
+        }
+
+        string[] severityParts = severity.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (severityParts.Length == 0) {
+            return null;
+        }
+
+        HashSet<DiagnosticSeverity> severities = new HashSet<DiagnosticSeverity>();
+        foreach (string severityPart in severityParts) {
+            DiagnosticSeverity parsedSeverity = severityPart.ToLowerInvariant() switch {
+                "error" => DiagnosticSeverity.Error,
+                "warning" => DiagnosticSeverity.Warning,
+                "info" => DiagnosticSeverity.Info,
+                _ => throw new McpException(
+                    $"Invalid severity '{severityPart}'. Accepted values are 'error', 'warning', and 'info'.")
+            };
+
+            severities.Add(parsedSeverity);
+        }
+
+        return severities;
+    }
+
+    private static int GetSeverityRank(DiagnosticSeverity severity) {
+        return severity switch {
+            DiagnosticSeverity.Error => 3,
+            DiagnosticSeverity.Warning => 2,
+            DiagnosticSeverity.Info => 1,
+            _ => 0
+        };
+    }
+
+    private static string MapSeverityToResponseValue(DiagnosticSeverity severity) {
+        return severity switch {
+            DiagnosticSeverity.Error => "error",
+            DiagnosticSeverity.Warning => "warning",
+            DiagnosticSeverity.Info => "info",
+            DiagnosticSeverity.Hidden => "hidden",
+            _ => severity.ToString().ToLowerInvariant()
+        };
+    }
+
+    private static object CreateDiagnosticResult(string projectName, Diagnostic diagnostic) {
+        FileLinePositionSpan lineSpan = diagnostic.Location.GetLineSpan();
+        object? location = null;
+
+        if (diagnostic.Location.IsInSource) {
+            location = new {
+                filePath = diagnostic.Location.SourceTree?.FilePath,
+                line = lineSpan.StartLinePosition.Line + 1,
+                column = lineSpan.StartLinePosition.Character + 1,
+                endLine = lineSpan.EndLinePosition.Line + 1,
+                endColumn = lineSpan.EndLinePosition.Character + 1
+            };
+        }
+
+        return new {
+            severity = MapSeverityToResponseValue(diagnostic.Severity),
+            code = diagnostic.Id,
+            message = diagnostic.GetMessage(),
+            projectName,
+            documentPath = diagnostic.Location.SourceTree?.FilePath,
+            location
+        };
+    }
     private static string GetProjectDisplayName(Project project) {
         if (project.AssemblyName.Equals(project.Name, StringComparison.OrdinalIgnoreCase)) {
             return project.Name;
@@ -1593,4 +1792,3 @@ public static class SolutionTools {
         return false;
     }
 }
-

@@ -13,6 +13,18 @@ namespace SharpTools.Tools.Mcp;
 /// These methods are used across various tools to provide consistent feedback.
 /// </summary>
 internal static class ContextInjectors {
+    internal static List<Diagnostic> FilterDiagnosticsForAgent(IEnumerable<Diagnostic> diagnostics, bool includeGeneratedCode = false) {
+        List<Diagnostic> filteredDiagnostics = new List<Diagnostic>();
+
+        foreach (Diagnostic diagnostic in diagnostics) {
+            if (ShouldIncludeDiagnostic(diagnostic, includeGeneratedCode)) {
+                filteredDiagnostics.Add(diagnostic);
+            }
+        }
+
+        return filteredDiagnostics;
+    }
+
     /// <summary>
     /// Checks for compilation errors in a document after code has been modified.
     /// </summary>
@@ -55,18 +67,12 @@ internal static class ContextInjectors {
             // Get semantic model
             var semanticModel = compilation.GetSemanticModel(syntaxTree);
             // Get all diagnostics for the specific syntax tree
-            var diagnostics = semanticModel.GetDiagnostics(cancellationToken: cancellationToken)
-            .Where(d => d.Severity == DiagnosticSeverity.Error || d.Severity == DiagnosticSeverity.Warning)
-            .OrderByDescending(d => d.Severity)  // Errors first, then warnings
-            .ThenBy(d => d.Location.SourceSpan.Start)
-            .ToList();
-            if (IsXamlCodeBehind(document)) {
-                var xamlNames = GetXamlNamedElements(document.FilePath);
-                diagnostics = diagnostics
-                    .Where(d => !IsInitializeComponentMissing(d))
-                    .Where(d => !IsMissingXamlMember(d, xamlNames))
-                    .ToList();
-            }
+            List<Diagnostic> diagnostics = FilterDiagnosticsForAgent(
+                semanticModel.GetDiagnostics(cancellationToken: cancellationToken)
+                    .Where(d => d.Severity == DiagnosticSeverity.Error || d.Severity == DiagnosticSeverity.Warning))
+                .OrderByDescending(d => d.Severity)  // Errors first, then warnings
+                .ThenBy(d => d.Location.SourceSpan.Start)
+                .ToList();
             if (!diagnostics.Any())
                 return (false, string.Empty);
             // Focus specifically on member access errors
@@ -104,9 +110,77 @@ internal static class ContextInjectors {
         var xamlPath = Path.ChangeExtension(document.FilePath, ".xaml");
         return !string.IsNullOrEmpty(xamlPath) && File.Exists(xamlPath);
     }
+    private static bool ShouldIncludeDiagnostic(Diagnostic diagnostic, bool includeGeneratedCode) {
+        string? documentFilePath = diagnostic.Location.SourceTree?.FilePath;
+        if (string.IsNullOrWhiteSpace(documentFilePath)) {
+            return true;
+        }
+
+        if (!includeGeneratedCode && IsTransientMauiGeneratedPath(documentFilePath)) {
+            return false;
+        }
+
+        if (!documentFilePath.EndsWith(".xaml.cs", StringComparison.OrdinalIgnoreCase)) {
+            return true;
+        }
+
+        if (IsInitializeComponentMissing(diagnostic)) {
+            return false;
+        }
+
+        if (IsAmbiguousInitializeComponent(diagnostic)) {
+            return false;
+        }
+
+        HashSet<string> xamlNames = GetXamlNamedElements(documentFilePath);
+        if (IsMissingXamlMember(diagnostic, xamlNames)) {
+            return false;
+        }
+
+        if (IsAmbiguousXamlMember(diagnostic, xamlNames)) {
+            return false;
+        }
+
+        return true;
+    }
+    internal static bool IsTransientMauiGeneratedPath(string? filePath) {
+        if (string.IsNullOrWhiteSpace(filePath)) {
+            return false;
+        }
+
+        string normalizedPath = filePath.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+        bool isGeneratedXamlPath = normalizedPath.EndsWith(".xaml.g.cs", StringComparison.OrdinalIgnoreCase)
+            || normalizedPath.EndsWith(".xaml.sg.cs", StringComparison.OrdinalIgnoreCase);
+
+        if (normalizedPath.IndexOf($"{Path.DirectorySeparatorChar}SharpTools{Path.DirectorySeparatorChar}Generated{Path.DirectorySeparatorChar}MauiXaml{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) >= 0) {
+            return true;
+        }
+
+        if (!isGeneratedXamlPath) {
+            return false;
+        }
+
+        if (normalizedPath.IndexOf($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) >= 0) {
+            return true;
+        }
+
+        if (normalizedPath.IndexOf($"{Path.DirectorySeparatorChar}VSGeneratedDocuments{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) >= 0) {
+            return true;
+        }
+
+        return false;
+    }
     private static bool IsInitializeComponentMissing(Diagnostic diagnostic) {
         if (!string.Equals(diagnostic.Id, "CS0103", StringComparison.OrdinalIgnoreCase)
             && !string.Equals(diagnostic.Id, "CS1061", StringComparison.OrdinalIgnoreCase)) {
+            return false;
+        }
+
+        return diagnostic.GetMessage().Contains("InitializeComponent", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAmbiguousInitializeComponent(Diagnostic diagnostic) {
+        if (!string.Equals(diagnostic.Id, "CS0121", StringComparison.OrdinalIgnoreCase)) {
             return false;
         }
 
@@ -125,6 +199,19 @@ internal static class ContextInjectors {
 
         var missingName = GetMissingMemberName(diagnostic.GetMessage());
         return !string.IsNullOrEmpty(missingName) && xamlNames.Contains(missingName);
+    }
+
+    private static bool IsAmbiguousXamlMember(Diagnostic diagnostic, HashSet<string> xamlNames) {
+        if (xamlNames.Count == 0) {
+            return false;
+        }
+
+        if (!string.Equals(diagnostic.Id, "CS0229", StringComparison.OrdinalIgnoreCase)) {
+            return false;
+        }
+
+        string? ambiguousName = GetMissingMemberName(diagnostic.GetMessage());
+        return !string.IsNullOrEmpty(ambiguousName) && xamlNames.Contains(ambiguousName);
     }
 
     private static string? GetMissingMemberName(string diagnosticMessage) {

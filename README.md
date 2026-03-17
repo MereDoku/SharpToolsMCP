@@ -67,6 +67,7 @@ SharpTools exposes a variety of "SharpTool_*" functions via MCP. Here's a brief 
 
 *   `SharpTool_LoadSolution`: Initializes the workspace with a given `.sln` file. This is the primary entry point.
 *   `SharpTool_LoadProject`: Provides a detailed structural overview of a specific project within the loaded solution, including namespaces and types, to aid AI understanding of the project's layout.
+*   `SharpTool_GetDiagnostics`: Returns structured compiler diagnostics for the loaded solution, a single project, or a single document, with severity, code, message, and source location. Generated/transient MAUI XAML diagnostics are hidden by default and can be included explicitly.
 
 ### Analysis Tools
 

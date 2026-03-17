@@ -24,21 +24,7 @@ public sealed class SolutionManager : ISolutionManager {
     private string? _targetFramework;
     private string? _runtimeIdentifier;
     private readonly SemaphoreSlim _loadSolutionSemaphore = new(1, 1);
-    private readonly ConcurrentDictionary<string, MauiRefreshAttempt> _mauiRefreshAttemptCache = new(StringComparer.OrdinalIgnoreCase);
     private IDisposable? _workspaceFailedRegistration;
-    private static readonly Regex XamlFilePathAttributeRegex = new(@"XamlFilePath(?:Attribute)?\s*\(\s*@?""(?<path>[^""]+\.xaml)""\s*\)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex XamlFilePathAssignmentRegex = new(@"XamlFilePath\s*=\s*@?""(?<path>[^""]+\.xaml)""", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex CSharpErrorCodeRegex = new(@"error\s+CS(?<code>\d{4})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly TimeSpan MauiRefreshFailureCooldown = TimeSpan.FromMinutes(10);
-
-    private sealed record MauiGeneratedSourceCandidate(string FilePath, string Source, string? XamlFilePath);
-    private sealed record MauiRefreshAttempt(DateTime AttemptUtc, bool Success, string Detail);
-    private sealed record MauiGeneratedRefreshAnalysis(
-        bool NeedsRefresh,
-        string Reason,
-        int DiscoveredCandidateCount,
-        int MappedXamlCount,
-        int IgnoredCandidateCount);
 
     public SolutionManager(ILogger<SolutionManager> logger, IFuzzyFqnLookupService fuzzyFqnLookupService, string? buildConfiguration = null) {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -54,7 +40,6 @@ public sealed class SolutionManager : ISolutionManager {
         long restoreDurationMs = 0;
         long openSolutionDurationMs = 0;
         long injectMauiGlobalUsingsDurationMs = 0;
-        long injectMauiXamlDurationMs = 0;
         long metadataInitializationDurationMs = 0;
 
         _logger.LogInformation(
@@ -138,15 +123,6 @@ public sealed class SolutionManager : ISolutionManager {
                 injectMauiGlobalUsingsDurationMs = injectMauiGlobalUsingsStopwatch.ElapsedMilliseconds;
                 _logger.LogInformation("Phase '{PhaseName}' completed in {ElapsedMs} ms", currentPhase, injectMauiGlobalUsingsDurationMs);
 
-                currentPhase = "inject-maui-xaml-generated-sources";
-                Stopwatch injectMauiXamlStopwatch = Stopwatch.StartNew();
-                if (_currentSolution != null) {
-                    await InjectMauiXamlGeneratedSourcesAsync(_currentSolution, cancellationToken);
-                }
-                injectMauiXamlStopwatch.Stop();
-                injectMauiXamlDurationMs = injectMauiXamlStopwatch.ElapsedMilliseconds;
-                _logger.LogInformation("Phase '{PhaseName}' completed in {ElapsedMs} ms", currentPhase, injectMauiXamlDurationMs);
-
                 currentPhase = "initialize-metadata-context";
                 Stopwatch metadataInitializationStopwatch = Stopwatch.StartNew();
                 InitializeMetadataContextAndReflectionCache(_currentSolution, cancellationToken);
@@ -175,16 +151,15 @@ public sealed class SolutionManager : ISolutionManager {
             }
 
             _logger.LogInformation(
-                "LoadSolutionAsync summary: total={TotalMs} ms; waitLock={WaitLockMs} ms; unload={UnloadMs} ms; configure={ConfigureMs} ms; restore={RestoreMs} ms; openSolution={OpenSolutionMs} ms; injectMauiGlobalUsings={InjectMauiGlobalUsingsMs} ms; injectMauiXaml={InjectMauiXamlMs} ms; metadata={MetadataMs} ms",
-                totalStopwatch.ElapsedMilliseconds,
-                waitLoadLockDurationMs,
-                unloadDurationMs,
-                configurePropertiesDurationMs,
-                restoreDurationMs,
-                openSolutionDurationMs,
-                injectMauiGlobalUsingsDurationMs,
-                injectMauiXamlDurationMs,
-                metadataInitializationDurationMs);
+                    "LoadSolutionAsync summary: total={TotalMs} ms; waitLock={WaitLockMs} ms; unload={UnloadMs} ms; configure={ConfigureMs} ms; restore={RestoreMs} ms; openSolution={OpenSolutionMs} ms; injectMauiGlobalUsings={InjectMauiGlobalUsingsMs} ms; metadata={MetadataMs} ms",
+                    totalStopwatch.ElapsedMilliseconds,
+                    waitLoadLockDurationMs,
+                    unloadDurationMs,
+                    configurePropertiesDurationMs,
+                    restoreDurationMs,
+                    openSolutionDurationMs,
+                    injectMauiGlobalUsingsDurationMs,
+                    metadataInitializationDurationMs);
 
             if (totalStopwatch.ElapsedMilliseconds > 45_000) {
                 _logger.LogWarning("LoadSolutionAsync exceeded expected duration: {ElapsedMs} ms", totalStopwatch.ElapsedMilliseconds);
@@ -418,765 +393,6 @@ public sealed class SolutionManager : ISolutionManager {
 
         return false;
     }
-    private async Task InjectMauiXamlGeneratedSourcesAsync(Solution solution, CancellationToken cancellationToken) {
-        Stopwatch injectMauiXamlStopwatch = Stopwatch.StartNew();
-        string configuration = string.IsNullOrWhiteSpace(_buildConfiguration) ? "Debug" : _buildConfiguration;
-        var updatedSolution = solution;
-        int mauiProjectsProcessed = 0;
-        int injectedProjects = 0;
-        int injectedDocuments = 0;
-        string? vsGeneratedDocumentsPath = GetVsGeneratedDocumentsPath();
-        var vsGeneratedFiles = string.IsNullOrWhiteSpace(vsGeneratedDocumentsPath)
-            ? new List<string>()
-            : FindMauiXamlGeneratedFiles(vsGeneratedDocumentsPath).ToList();
-        var xamlPathCache = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-        try {
-            foreach (var project in solution.Projects) {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                if (string.IsNullOrEmpty(project.FilePath)) {
-                    continue;
-                }
-
-                if (!ProjectUsesMaui(project.FilePath)) {
-                    continue;
-                }
-
-                mauiProjectsProcessed++;
-                Stopwatch projectInjectionStopwatch = Stopwatch.StartNew();
-                int projectDiscoveredCandidates = 0;
-                int projectSelectedCandidates = 0;
-                int projectInjectedDocuments = 0;
-                bool refreshRequested = false;
-                bool refreshSkipped = false;
-
-                try {
-                    string projectTargetFramework = _targetFramework ?? SolutionTools.ExtractTargetFrameworkFromProjectFile(project.FilePath);
-                    if (string.IsNullOrWhiteSpace(projectTargetFramework)) {
-                        _logger.LogWarning("Could not determine target framework for project {ProjectName}; skipping MAUI XAML injection.", project.Name);
-                        continue;
-                    }
-
-                    var projectDir = Path.GetDirectoryName(project.FilePath);
-                    if (string.IsNullOrEmpty(projectDir)) {
-                        continue;
-                    }
-
-                    var objSearchPaths = GetMauiGlobalUsingsSearchPaths(projectDir, configuration, projectTargetFramework);
-                    var compilerGeneratedSearchPaths = GetMauiCompilerGeneratedSearchPaths(projectDir, configuration, projectTargetFramework);
-                    string? effectiveRuntimeIdentifier = ResolveRuntimeIdentifierForTargetFramework(projectTargetFramework);
-                    string refreshCacheKey = BuildMauiRefreshCacheKey(project.FilePath, projectTargetFramework, effectiveRuntimeIdentifier, configuration);
-
-                    var discoveredCandidates = new List<MauiGeneratedSourceCandidate>();
-                    CollectMauiGeneratedSourceCandidates(
-                        discoveredCandidates,
-                        objSearchPaths,
-                        compilerGeneratedSearchPaths,
-                        vsGeneratedFiles,
-                        projectDir,
-                        xamlPathCache,
-                        cancellationToken);
-                    projectDiscoveredCandidates = discoveredCandidates.Count;
-
-                    MauiGeneratedRefreshAnalysis refreshAnalysis = AnalyzeMauiGeneratedSourcesRefresh(projectDir, discoveredCandidates, cancellationToken);
-                    _logger.LogInformation(
-                        "MAUI generated source mapping for project {ProjectName}: discovered={DiscoveredCount}, mapped={MappedCount}, ignored={IgnoredCount}",
-                        project.Name,
-                        refreshAnalysis.DiscoveredCandidateCount,
-                        refreshAnalysis.MappedXamlCount,
-                        refreshAnalysis.IgnoredCandidateCount);
-                    if (refreshAnalysis.NeedsRefresh) {
-                        refreshRequested = true;
-                        _logger.LogInformation(
-                            "MAUI generated sources refresh required for project {ProjectName}: {Reason}",
-                            project.Name,
-                            refreshAnalysis.Reason);
-
-                        if (ShouldSkipMauiRefreshBuild(refreshCacheKey, out MauiRefreshAttempt? lastFailedAttempt, out TimeSpan retryAfter)) {
-                            refreshSkipped = true;
-                            _logger.LogWarning(
-                                "Skipping MAUI refresh build for project {ProjectName} due to recent failed attempt. Retry in {RetryAfter}. Last failure detail: {LastFailureDetail}",
-                                project.Name,
-                                retryAfter,
-                                lastFailedAttempt?.Detail ?? "unknown");
-                        } else {
-                            var (generatedOutputPath, refreshSucceeded) = await GenerateMauiXamlSourcesForProjectAsync(project.FilePath, configuration, projectTargetFramework, cancellationToken);
-                            RecordMauiRefreshAttempt(refreshCacheKey, refreshSucceeded, refreshSucceeded ? "refresh build succeeded" : "refresh build failed");
-
-                            discoveredCandidates.Clear();
-                            AddMauiGeneratedSourceCandidates(
-                                discoveredCandidates,
-                                FindMauiXamlGeneratedFiles(generatedOutputPath),
-                                "compiler-generated",
-                                projectDir,
-                                requireProjectMatchByXamlPath: false,
-                                xamlPathCache,
-                                cancellationToken);
-                            CollectMauiGeneratedSourceCandidates(
-                                discoveredCandidates,
-                                objSearchPaths,
-                                compilerGeneratedSearchPaths,
-                                vsGeneratedFiles,
-                                projectDir,
-                                xamlPathCache,
-                                cancellationToken);
-                            projectDiscoveredCandidates = discoveredCandidates.Count;
-
-                            MauiGeneratedRefreshAnalysis postRefreshAnalysis = AnalyzeMauiGeneratedSourcesRefresh(projectDir, discoveredCandidates, cancellationToken);
-                            _logger.LogInformation(
-                                "Post-refresh MAUI source mapping for project {ProjectName}: discovered={DiscoveredCount}, mapped={MappedCount}, ignored={IgnoredCount}",
-                                project.Name,
-                                postRefreshAnalysis.DiscoveredCandidateCount,
-                                postRefreshAnalysis.MappedXamlCount,
-                                postRefreshAnalysis.IgnoredCandidateCount);
-                            if (postRefreshAnalysis.NeedsRefresh) {
-                                _logger.LogWarning(
-                                    "MAUI generated sources may still be stale for project {ProjectName} after refresh: {Reason}",
-                                    project.Name,
-                                    postRefreshAnalysis.Reason);
-                            }
-                        }
-                    }
-
-                    if (discoveredCandidates.Count == 0) {
-                        continue;
-                    }
-
-                    var selectedCandidates = SelectPreferredMauiGeneratedCandidates(discoveredCandidates);
-                    projectSelectedCandidates = selectedCandidates.Count;
-                    int objCount = discoveredCandidates.Count(c => c.Source == "obj");
-                    int compilerGeneratedCount = discoveredCandidates.Count(c => c.Source == "compiler-generated");
-                    int vsGeneratedDocumentsCount = discoveredCandidates.Count(c => c.Source == "vs-generated-documents");
-                    _logger.LogInformation(
-                        "Discovered {TotalCount} MAUI generated source candidate(s) for project {ProjectName}. obj={ObjCount}, compiler-generated={CompilerGeneratedCount}, vs-generated-documents={VsGeneratedCount}",
-                        discoveredCandidates.Count,
-                        project.Name,
-                        objCount,
-                        compilerGeneratedCount,
-                        vsGeneratedDocumentsCount);
-
-                    foreach (var candidate in selectedCandidates) {
-                        string generatedFile = candidate.FilePath;
-                        if (project.Documents.Any(d => d.FilePath != null &&
-                            string.Equals(d.FilePath, generatedFile, StringComparison.OrdinalIgnoreCase))) {
-                            continue;
-                        }
-
-                        string generatedContent = await File.ReadAllTextAsync(generatedFile, cancellationToken);
-                        var injectedText = SourceText.From(generatedContent, Encoding.UTF8);
-                        var injectedDocName = Path.GetFileName(generatedFile);
-                        updatedSolution = updatedSolution.AddDocument(
-                            DocumentId.CreateNewId(project.Id),
-                            injectedDocName,
-                            injectedText,
-                            new[] { "SharpTools", "Generated", "MauiXaml" },
-                            filePath: generatedFile
-                        );
-
-                        injectedDocuments++;
-                        projectInjectedDocuments++;
-                    }
-
-                    if (projectInjectedDocuments > 0) {
-                        injectedProjects++;
-                        _logger.LogInformation(
-                            "Injected {DocumentCount} MAUI XAML generated document(s) into project {ProjectName} after selecting {SelectedCount} preferred candidate(s).",
-                            projectInjectedDocuments,
-                            project.Name,
-                            selectedCandidates.Count);
-                    }
-                } finally {
-                    projectInjectionStopwatch.Stop();
-                    _logger.LogInformation(
-                        "MAUI XAML injection phase completed for project {ProjectName} in {ElapsedMs} ms (refreshRequested={RefreshRequested}, refreshSkipped={RefreshSkipped}, discovered={DiscoveredCount}, selected={SelectedCount}, injected={InjectedCount})",
-                        project.Name,
-                        projectInjectionStopwatch.ElapsedMilliseconds,
-                        refreshRequested,
-                        refreshSkipped,
-                        projectDiscoveredCandidates,
-                        projectSelectedCandidates,
-                        projectInjectedDocuments);
-                }
-            }
-
-            if (injectedDocuments > 0) {
-                _currentSolution = updatedSolution;
-                _compilationCache.Clear();
-                _semanticModelCache.Clear();
-                _logger.LogInformation(
-                    "MAUI XAML generated sources injected into {ProjectCount} project(s) in-memory only (no project file persistence).",
-                    injectedProjects);
-            }
-        } finally {
-            injectMauiXamlStopwatch.Stop();
-            _logger.LogInformation(
-                "Phase '{PhaseName}' completed in {ElapsedMs} ms (mauiProjectsProcessed={MauiProjectsProcessed}, injectedProjects={InjectedProjects}, injectedDocuments={InjectedDocuments})",
-                nameof(InjectMauiXamlGeneratedSourcesAsync),
-                injectMauiXamlStopwatch.ElapsedMilliseconds,
-                mauiProjectsProcessed,
-                injectedProjects,
-                injectedDocuments);
-        }
-    }
-    private async Task<(string GeneratedOutputPath, bool Success)> GenerateMauiXamlSourcesForProjectAsync(string projectFilePath, string configuration, string targetFramework, CancellationToken cancellationToken) {
-        string projectDir = Path.GetDirectoryName(projectFilePath) ?? string.Empty;
-        string generatedOutputPath = GetMauiCompilerGeneratedOutputPath(projectDir, configuration, targetFramework);
-        try {
-            Directory.CreateDirectory(generatedOutputPath);
-        } catch (Exception ex) {
-            _logger.LogWarning(ex, "Failed to create compiler-generated output directory at {GeneratedOutputPath}", generatedOutputPath);
-            return (generatedOutputPath, false);
-        }
-
-        ProcessStartInfo startInfo = new ProcessStartInfo {
-            FileName = "dotnet",
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = projectDir
-        };
-
-        startInfo.ArgumentList.Add("msbuild");
-        startInfo.ArgumentList.Add(projectFilePath);
-        startInfo.ArgumentList.Add("-t:Compile");
-        startInfo.ArgumentList.Add("-nologo");
-        startInfo.ArgumentList.Add("-verbosity:minimal");
-        startInfo.ArgumentList.Add("-p:DesignTimeBuild=true");
-        startInfo.ArgumentList.Add("-p:BuildingProject=true");
-        startInfo.ArgumentList.Add("-p:SkipCompilerExecution=false");
-        startInfo.ArgumentList.Add("-p:EmitCompilerGeneratedFiles=true");
-        startInfo.ArgumentList.Add($"-p:CompilerGeneratedFilesOutputPath={generatedOutputPath}");
-        startInfo.ArgumentList.Add("-p:SkipInvalidConfigurations=true");
-        startInfo.ArgumentList.Add($"-p:TargetFramework={targetFramework}");
-
-        if (!string.IsNullOrWhiteSpace(_runtimeIdentifier)) {
-            startInfo.ArgumentList.Add($"-p:RuntimeIdentifier={_runtimeIdentifier}");
-        }
-
-        if (!string.IsNullOrWhiteSpace(configuration)) {
-            startInfo.ArgumentList.Add($"-p:Configuration={configuration}");
-        }
-
-        _logger.LogInformation(
-            "Generating MAUI XAML sources for project {ProjectFilePath} (TargetFramework={TargetFramework}, RuntimeIdentifier={RuntimeIdentifier}, Configuration={Configuration}, Output={OutputPath})",
-            projectFilePath,
-            targetFramework,
-            string.IsNullOrWhiteSpace(_runtimeIdentifier) ? "auto" : _runtimeIdentifier,
-            configuration,
-            generatedOutputPath);
-
-        using Process process = new Process {
-            StartInfo = startInfo
-        };
-
-        var outputBuilder = new StringBuilder();
-        var errorBuilder = new StringBuilder();
-        process.OutputDataReceived += (_, eventArgs) => {
-            if (!string.IsNullOrWhiteSpace(eventArgs.Data)) {
-                outputBuilder.AppendLine(eventArgs.Data);
-            }
-        };
-        process.ErrorDataReceived += (_, eventArgs) => {
-            if (!string.IsNullOrWhiteSpace(eventArgs.Data)) {
-                errorBuilder.AppendLine(eventArgs.Data);
-            }
-        };
-
-        Stopwatch stopwatch = Stopwatch.StartNew();
-        if (!process.Start()) {
-            _logger.LogWarning("Failed to start dotnet msbuild for MAUI generated sources on project {ProjectFilePath}", projectFilePath);
-            return (generatedOutputPath, false);
-        }
-
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-
-        try {
-            await process.WaitForExitAsync(cancellationToken);
-        } catch (OperationCanceledException) {
-            try {
-                if (!process.HasExited) {
-                    process.Kill(entireProcessTree: true);
-                }
-            } catch {
-                // Best-effort kill on cancellation.
-            }
-            throw;
-        } finally {
-            stopwatch.Stop();
-        }
-
-        if (process.ExitCode == 0) {
-            _logger.LogInformation(
-                "MAUI XAML generation build succeeded for {ProjectFilePath} in {ElapsedMilliseconds} ms.",
-                projectFilePath,
-                stopwatch.ElapsedMilliseconds);
-            return (generatedOutputPath, true);
-        }
-
-        string errorOutput = errorBuilder.ToString().Trim();
-        string standardOutput = outputBuilder.ToString().Trim();
-        string details = BuildCombinedProcessOutput(errorOutput, standardOutput);
-        if (string.IsNullOrWhiteSpace(details)) {
-            details = "No output captured.";
-        }
-
-        if (IsNonFatalMauiRefreshFailure(details)) {
-            int generatedSourceCount = CountAvailableMauiGeneratedSources(projectDir, configuration, targetFramework, generatedOutputPath);
-            if (generatedSourceCount > 0) {
-                string sanitizedDetails = SanitizeMauiRefreshDetailsForLog(details);
-                if (string.IsNullOrWhiteSpace(sanitizedDetails)) {
-                    sanitizedDetails = "Only expected design-time diagnostics were reported and ignored.";
-                }
-
-                _logger.LogInformation(
-                    "MAUI XAML generation build completed with non-fatal diagnostics for {ProjectFilePath} after {ElapsedMilliseconds} ms. Generated source files available: {GeneratedSourceCount}. Details: {Details}",
-                    projectFilePath,
-                    stopwatch.ElapsedMilliseconds,
-                    generatedSourceCount,
-                    TrimForLog(sanitizedDetails, 2000));
-                return (generatedOutputPath, true);
-            }
-        }
-
-        _logger.LogWarning(
-            "MAUI XAML generation build failed for {ProjectFilePath} with exit code {ExitCode} after {ElapsedMilliseconds} ms. Details: {Details}",
-            projectFilePath,
-            process.ExitCode,
-            stopwatch.ElapsedMilliseconds,
-            TrimForLog(details, 2000));
-
-        return (generatedOutputPath, false);
-    }
-    private static string BuildCombinedProcessOutput(string errorOutput, string standardOutput) {
-        if (string.IsNullOrWhiteSpace(errorOutput)) {
-            return standardOutput;
-        }
-
-        if (string.IsNullOrWhiteSpace(standardOutput)) {
-            return errorOutput;
-        }
-
-        return $"{errorOutput}{Environment.NewLine}{standardOutput}";
-    }
-    private static bool IsNonFatalMauiRefreshFailure(string buildOutput) {
-        if (string.IsNullOrWhiteSpace(buildOutput)) {
-            return false;
-        }
-
-        bool hasErrors = false;
-        foreach (string line in buildOutput.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries)) {
-            Match errorMatch = CSharpErrorCodeRegex.Match(line);
-            if (!errorMatch.Success) {
-                continue;
-            }
-
-            hasErrors = true;
-            string code = errorMatch.Groups["code"].Value;
-            if (IsIgnorableMauiRefreshDiagnosticLine(line, code)) {
-                continue;
-            }
-
-            return false;
-        }
-
-        return hasErrors;
-    }
-    private static bool IsIgnorableMauiRefreshDiagnosticLine(string line, string errorCode) {
-        if (string.Equals(errorCode, "5001", StringComparison.Ordinal)) {
-            return true;
-        }
-
-        if (!string.Equals(errorCode, "1061", StringComparison.Ordinal)
-            && !string.Equals(errorCode, "0103", StringComparison.Ordinal)) {
-            return false;
-        }
-
-        bool isInitializeComponentError = line.Contains("InitializeComponent", StringComparison.OrdinalIgnoreCase);
-        bool isWindowsAppCodeBehind = line.Contains(@"Platforms\Windows\App.xaml.cs", StringComparison.OrdinalIgnoreCase);
-        return isInitializeComponentError && isWindowsAppCodeBehind;
-    }
-    private static string SanitizeMauiRefreshDetailsForLog(string details) {
-        if (string.IsNullOrWhiteSpace(details)) {
-            return details;
-        }
-
-        var filteredLines = new List<string>();
-        foreach (string line in details.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)) {
-            Match errorMatch = CSharpErrorCodeRegex.Match(line);
-            if (!errorMatch.Success) {
-                filteredLines.Add(line);
-                continue;
-            }
-
-            string code = errorMatch.Groups["code"].Value;
-            if (IsIgnorableMauiRefreshDiagnosticLine(line, code)) {
-                continue;
-            }
-
-            filteredLines.Add(line);
-        }
-
-        return string.Join(Environment.NewLine, filteredLines).Trim();
-    }
-    private int CountAvailableMauiGeneratedSources(string projectDir, string configuration, string targetFramework, string generatedOutputPath) {
-        var generatedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (string filePath in FindMauiXamlGeneratedFiles(generatedOutputPath)) {
-            generatedFiles.Add(filePath);
-        }
-
-        foreach (string rootPath in GetMauiGlobalUsingsSearchPaths(projectDir, configuration, targetFramework)) {
-            foreach (string filePath in FindMauiXamlGeneratedFiles(rootPath)) {
-                generatedFiles.Add(filePath);
-            }
-        }
-
-        foreach (string rootPath in GetMauiCompilerGeneratedSearchPaths(projectDir, configuration, targetFramework)) {
-            foreach (string filePath in FindMauiXamlGeneratedFiles(rootPath)) {
-                generatedFiles.Add(filePath);
-            }
-        }
-
-        string? vsGeneratedDocumentsPath = GetVsGeneratedDocumentsPath();
-        if (!string.IsNullOrWhiteSpace(vsGeneratedDocumentsPath)) {
-            foreach (string filePath in FindMauiXamlGeneratedFiles(vsGeneratedDocumentsPath)) {
-                generatedFiles.Add(filePath);
-            }
-        }
-
-        return generatedFiles.Count;
-    }
-    private static string TrimForLog(string text, int maxLength) {
-        if (string.IsNullOrEmpty(text) || text.Length <= maxLength) {
-            return text;
-        }
-
-        return text.Substring(0, maxLength) + "...";
-    }
-    private static void AddMauiGeneratedSourceCandidates(
-        List<MauiGeneratedSourceCandidate> destination,
-        IEnumerable<string> filePaths,
-        string source,
-        string projectDir,
-        bool requireProjectMatchByXamlPath,
-        Dictionary<string, string?> xamlPathCache,
-        CancellationToken cancellationToken) {
-        foreach (string filePath in filePaths) {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath)) {
-                continue;
-            }
-
-            string? xamlFilePath = GetOrExtractXamlFilePath(filePath, projectDir, xamlPathCache);
-            bool hasProjectMatch = !string.IsNullOrWhiteSpace(xamlFilePath) && IsPathUnderDirectory(xamlFilePath, projectDir);
-
-            if (requireProjectMatchByXamlPath && !hasProjectMatch) {
-                continue;
-            }
-
-            destination.Add(new MauiGeneratedSourceCandidate(filePath, source, xamlFilePath));
-        }
-    }
-    private static void CollectMauiGeneratedSourceCandidates(
-        List<MauiGeneratedSourceCandidate> destination,
-        IEnumerable<string> objSearchPaths,
-        IEnumerable<string> compilerGeneratedSearchPaths,
-        IEnumerable<string> vsGeneratedFiles,
-        string projectDir,
-        Dictionary<string, string?> xamlPathCache,
-        CancellationToken cancellationToken) {
-        AddMauiGeneratedSourceCandidates(
-            destination,
-            objSearchPaths.SelectMany(FindMauiXamlGeneratedFiles),
-            "obj",
-            projectDir,
-            requireProjectMatchByXamlPath: false,
-            xamlPathCache,
-            cancellationToken);
-        AddMauiGeneratedSourceCandidates(
-            destination,
-            compilerGeneratedSearchPaths.SelectMany(FindMauiXamlGeneratedFiles),
-            "compiler-generated",
-            projectDir,
-            requireProjectMatchByXamlPath: false,
-            xamlPathCache,
-            cancellationToken);
-        AddMauiGeneratedSourceCandidates(
-            destination,
-            vsGeneratedFiles,
-            "vs-generated-documents",
-            projectDir,
-            requireProjectMatchByXamlPath: true,
-            xamlPathCache,
-            cancellationToken);
-    }
-    private static MauiGeneratedRefreshAnalysis AnalyzeMauiGeneratedSourcesRefresh(
-        string projectDir,
-        IReadOnlyCollection<MauiGeneratedSourceCandidate> discoveredCandidates,
-        CancellationToken cancellationToken) {
-        if (discoveredCandidates.Count == 0) {
-            return new MauiGeneratedRefreshAnalysis(
-                NeedsRefresh: true,
-                Reason: "no generated source candidates were found",
-                DiscoveredCandidateCount: 0,
-                MappedXamlCount: 0,
-                IgnoredCandidateCount: 0);
-        }
-
-        int ignoredCandidateCount = 0;
-        var candidateByXamlPath = new Dictionary<string, MauiGeneratedSourceCandidate>(StringComparer.OrdinalIgnoreCase);
-        foreach (MauiGeneratedSourceCandidate candidate in discoveredCandidates) {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (string.IsNullOrWhiteSpace(candidate.XamlFilePath)) {
-                ignoredCandidateCount++;
-                continue;
-            }
-            if (!IsPathUnderDirectory(candidate.XamlFilePath, projectDir)) {
-                ignoredCandidateCount++;
-                continue;
-            }
-            if (!File.Exists(candidate.FilePath)) {
-                ignoredCandidateCount++;
-                continue;
-            }
-            if (!File.Exists(candidate.XamlFilePath)) {
-                ignoredCandidateCount++;
-                continue;
-            }
-
-            if (!candidateByXamlPath.TryGetValue(candidate.XamlFilePath, out MauiGeneratedSourceCandidate? existingCandidate)) {
-                candidateByXamlPath[candidate.XamlFilePath] = candidate;
-                continue;
-            }
-
-            DateTime existingWriteTime = File.GetLastWriteTimeUtc(existingCandidate.FilePath);
-            DateTime currentWriteTime = File.GetLastWriteTimeUtc(candidate.FilePath);
-            if (currentWriteTime > existingWriteTime) {
-                candidateByXamlPath[candidate.XamlFilePath] = candidate;
-            }
-        }
-
-        if (candidateByXamlPath.Count == 0) {
-            return new MauiGeneratedRefreshAnalysis(
-                NeedsRefresh: true,
-                Reason: "no discovered generated sources could be mapped back to source-generator XAML paths",
-                DiscoveredCandidateCount: discoveredCandidates.Count,
-                MappedXamlCount: 0,
-                IgnoredCandidateCount: ignoredCandidateCount);
-        }
-
-        foreach (var mappedEntry in candidateByXamlPath) {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (IsGeneratedSourceStale(mappedEntry.Key, mappedEntry.Value.FilePath)) {
-                return new MauiGeneratedRefreshAnalysis(
-                    NeedsRefresh: true,
-                    Reason: $"generated source is stale for '{Path.GetFileName(mappedEntry.Key)}' ({mappedEntry.Key})",
-                    DiscoveredCandidateCount: discoveredCandidates.Count,
-                    MappedXamlCount: candidateByXamlPath.Count,
-                    IgnoredCandidateCount: ignoredCandidateCount);
-            }
-        }
-
-        return new MauiGeneratedRefreshAnalysis(
-            NeedsRefresh: false,
-            Reason: string.Empty,
-            DiscoveredCandidateCount: discoveredCandidates.Count,
-            MappedXamlCount: candidateByXamlPath.Count,
-            IgnoredCandidateCount: ignoredCandidateCount);
-    }
-    private static bool IsGeneratedSourceStale(string xamlFilePath, string generatedFilePath) {
-        if (!File.Exists(xamlFilePath) || !File.Exists(generatedFilePath)) {
-            return true;
-        }
-
-        DateTime xamlWriteTime = File.GetLastWriteTimeUtc(xamlFilePath);
-        DateTime generatedWriteTime = File.GetLastWriteTimeUtc(generatedFilePath);
-        return xamlWriteTime > generatedWriteTime;
-    }
-    private static List<MauiGeneratedSourceCandidate> SelectPreferredMauiGeneratedCandidates(IEnumerable<MauiGeneratedSourceCandidate> candidates) {
-        var bestByKey = new Dictionary<string, MauiGeneratedSourceCandidate>(StringComparer.OrdinalIgnoreCase);
-        foreach (MauiGeneratedSourceCandidate candidate in candidates) {
-            string key = string.IsNullOrWhiteSpace(candidate.XamlFilePath) ? candidate.FilePath : candidate.XamlFilePath!;
-            if (!bestByKey.TryGetValue(key, out MauiGeneratedSourceCandidate? currentBest)) {
-                bestByKey[key] = candidate;
-                continue;
-            }
-
-            int currentScore = GetMauiGeneratedCandidatePreferenceScore(currentBest);
-            int newScore = GetMauiGeneratedCandidatePreferenceScore(candidate);
-            if (newScore > currentScore) {
-                bestByKey[key] = candidate;
-            }
-        }
-
-        return bestByKey.Values
-            .OrderBy(c => c.FilePath, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-    }
-    private static int GetMauiGeneratedCandidatePreferenceScore(MauiGeneratedSourceCandidate candidate) {
-        int score = 0;
-        if (candidate.FilePath.EndsWith(".xaml.sg.cs", StringComparison.OrdinalIgnoreCase)) {
-            score += 400;
-        } else if (candidate.FilePath.EndsWith(".xaml.g.cs", StringComparison.OrdinalIgnoreCase)) {
-            score += 300;
-        } else if (candidate.FilePath.EndsWith(".sg.cs", StringComparison.OrdinalIgnoreCase)) {
-            score += 250;
-        } else {
-            score += 200;
-        }
-
-        if (!string.Equals(candidate.Source, "vs-generated-documents", StringComparison.OrdinalIgnoreCase)) {
-            score += 25;
-        }
-
-        if (!string.IsNullOrWhiteSpace(candidate.XamlFilePath)) {
-            score += 10;
-        }
-
-        return score;
-    }
-    private static string? GetOrExtractXamlFilePath(string generatedFilePath, string projectDir, Dictionary<string, string?> xamlPathCache) {
-        if (xamlPathCache.TryGetValue(generatedFilePath, out string? cachedValue)) {
-            return cachedValue;
-        }
-
-        string? extractedValue = TryExtractXamlFilePath(generatedFilePath, projectDir);
-        xamlPathCache[generatedFilePath] = extractedValue;
-        return extractedValue;
-    }
-    private static string? TryExtractXamlFilePath(string generatedFilePath, string projectDir) {
-        try {
-            string text = File.ReadAllText(generatedFilePath);
-            Match match = XamlFilePathAttributeRegex.Match(text);
-            if (!match.Success) {
-                match = XamlFilePathAssignmentRegex.Match(text);
-            }
-
-            if (!match.Success) {
-                return null;
-            }
-
-            string extractedPath = match.Groups["path"].Value;
-            if (string.IsNullOrWhiteSpace(extractedPath)) {
-                return null;
-            }
-
-            return NormalizeExtractedPath(extractedPath, projectDir);
-        } catch {
-            return null;
-        }
-    }
-    private static string? NormalizeExtractedPath(string extractedPath, string projectDir) {
-        try {
-            string normalized = extractedPath.Trim();
-            normalized = normalized.Replace("\\\\", "\\", StringComparison.Ordinal);
-            normalized = normalized.Replace('/', Path.DirectorySeparatorChar);
-            if (!Path.IsPathRooted(normalized)) {
-                normalized = Path.GetFullPath(Path.Combine(projectDir, normalized));
-            } else {
-                normalized = Path.GetFullPath(normalized);
-            }
-
-            return normalized;
-        } catch {
-            return null;
-        }
-    }
-    private static bool IsPathUnderDirectory(string candidatePath, string directoryPath) {
-        try {
-            string fullCandidatePath = Path.GetFullPath(candidatePath)
-                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            string fullDirectoryPath = Path.GetFullPath(directoryPath)
-                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            string directoryPrefix = fullDirectoryPath + Path.DirectorySeparatorChar;
-            return fullCandidatePath.StartsWith(directoryPrefix, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(fullCandidatePath, fullDirectoryPath, StringComparison.OrdinalIgnoreCase);
-        } catch {
-            return false;
-        }
-    }
-    private static string? GetVsGeneratedDocumentsPath() {
-        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        if (string.IsNullOrWhiteSpace(localAppData)) {
-            return null;
-        }
-
-        string vsGeneratedDocumentsPath = Path.Combine(localAppData, "Temp", "VSGeneratedDocuments");
-        if (!Directory.Exists(vsGeneratedDocumentsPath)) {
-            return null;
-        }
-
-        return vsGeneratedDocumentsPath;
-    }
-    private List<string> GetMauiCompilerGeneratedSearchPaths(string projectDir, string configuration, string targetFramework) {
-        var paths = new List<string>();
-        string basePath = Path.Combine(projectDir, "obj", configuration, targetFramework, "SharpTools", "CompilerGenerated");
-        paths.Add(basePath);
-
-        if (targetFramework.Contains("-windows", StringComparison.OrdinalIgnoreCase)) {
-            var runtimeIdentifiers = GetWindowsRuntimeIdentifierCandidates();
-            for (int index = runtimeIdentifiers.Count - 1; index >= 0; index--) {
-                string runtimeIdentifier = runtimeIdentifiers[index];
-                paths.Insert(0, Path.Combine(projectDir, "obj", configuration, targetFramework, runtimeIdentifier, "SharpTools", "CompilerGenerated"));
-            }
-        }
-
-        return paths;
-    }
-    private string GetMauiCompilerGeneratedOutputPath(string projectDir, string configuration, string targetFramework) {
-        List<string> searchPaths = GetMauiCompilerGeneratedSearchPaths(projectDir, configuration, targetFramework);
-        if (searchPaths.Count == 0) {
-            return Path.Combine(projectDir, "obj", configuration, targetFramework, "SharpTools", "CompilerGenerated");
-        }
-
-        foreach (string path in searchPaths) {
-            if (Directory.Exists(path)) {
-                return path;
-            }
-        }
-
-        return searchPaths[0];
-    }
-    private string? ResolveRuntimeIdentifierForTargetFramework(string targetFramework) {
-        if (!string.IsNullOrWhiteSpace(_runtimeIdentifier)) {
-            return _runtimeIdentifier;
-        }
-
-        if (targetFramework.Contains("-windows", StringComparison.OrdinalIgnoreCase)) {
-            return GetDefaultRuntimeIdentifier();
-        }
-
-        return null;
-    }
-    private static string BuildMauiRefreshCacheKey(string projectFilePath, string targetFramework, string? runtimeIdentifier, string configuration) {
-        string normalizedProjectPath = Path.GetFullPath(projectFilePath);
-        string normalizedRuntimeIdentifier = string.IsNullOrWhiteSpace(runtimeIdentifier) ? "auto" : runtimeIdentifier;
-        string normalizedConfiguration = string.IsNullOrWhiteSpace(configuration) ? "Debug" : configuration;
-        return $"{normalizedProjectPath}|{targetFramework}|{normalizedRuntimeIdentifier}|{normalizedConfiguration}";
-    }
-    private bool ShouldSkipMauiRefreshBuild(string cacheKey, out MauiRefreshAttempt? lastAttempt, out TimeSpan retryAfter) {
-        retryAfter = TimeSpan.Zero;
-        if (!_mauiRefreshAttemptCache.TryGetValue(cacheKey, out lastAttempt) || lastAttempt == null) {
-            return false;
-        }
-
-        if (lastAttempt.Success) {
-            return false;
-        }
-
-        TimeSpan elapsed = DateTime.UtcNow - lastAttempt.AttemptUtc;
-        if (elapsed >= MauiRefreshFailureCooldown) {
-            return false;
-        }
-
-        retryAfter = MauiRefreshFailureCooldown - elapsed;
-        return true;
-    }
-    private void RecordMauiRefreshAttempt(string cacheKey, bool success, string detail) {
-        _mauiRefreshAttemptCache[cacheKey] = new MauiRefreshAttempt(DateTime.UtcNow, success, detail);
-    }
     private async Task RestoreSolutionDependenciesAsync(string solutionPath, CancellationToken cancellationToken) {
         Stopwatch restoreStopwatch = Stopwatch.StartNew();
         ProcessStartInfo startInfo = new ProcessStartInfo {
@@ -1291,6 +507,13 @@ public sealed class SolutionManager : ISolutionManager {
         } catch {
             return false;
         }
+    }
+    private static string TrimForLog(string text, int maxLength) {
+        if (string.IsNullOrEmpty(text) || text.Length <= maxLength) {
+            return text;
+        }
+
+        return text.Substring(0, maxLength) + "...";
     }
     private static bool CompilationHasMauiGlobalUsings(Compilation compilation) {
         foreach (var syntaxTree in compilation.SyntaxTrees) {
@@ -1622,8 +845,14 @@ public sealed class SolutionManager : ISolutionManager {
             _logger.LogWarning("Multiple matches found for {FullyQualifiedTypeName}", fullyQualifiedTypeName);
             throw new McpException($"FQN was ambiguous, did you mean one of these?\n{string.Join("\n", matchList.Select(m => m.CanonicalFqn))}");
         }
+        var solution = CurrentSolution;
+        if (solution == null) {
+            _logger.LogWarning("Cannot find named type symbol: No solution loaded.");
+            return null;
+        }
+
         // Direct lookup as fallback
-        foreach (var project in CurrentSolution.Projects) {
+        foreach (var project in solution.Projects) {
             // Check cancellation before each project
             cancellationToken.ThrowIfCancellationRequested();
             var compilation = await GetCompilationAsync(project.Id, cancellationToken);
@@ -1644,7 +873,7 @@ public sealed class SolutionManager : ISolutionManager {
         if (lastDotIndex > 0) {
             var parentTypeName = fullyQualifiedTypeName.Substring(0, lastDotIndex);
             var nestedTypeName = fullyQualifiedTypeName.Substring(lastDotIndex + 1);
-            foreach (var project in CurrentSolution.Projects) {
+            foreach (var project in solution.Projects) {
                 // Check cancellation before each project
                 cancellationToken.ThrowIfCancellationRequested();
                 var compilation = await GetCompilationAsync(project.Id, cancellationToken);
@@ -1845,7 +1074,13 @@ public sealed class SolutionManager : ISolutionManager {
         // Check cancellation before document lookup
         cancellationToken.ThrowIfCancellationRequested();
 
-        var document = CurrentSolution.GetDocument(documentId);
+        var solution = CurrentSolution;
+        if (solution == null) {
+            _logger.LogWarning("Cannot get semantic model: No solution loaded.");
+            return null;
+        }
+
+        var document = solution.GetDocument(documentId);
         if (document == null) {
             _logger.LogWarning("Document not found for ID: {DocumentId}", documentId);
             return null;
@@ -1882,7 +1117,13 @@ public sealed class SolutionManager : ISolutionManager {
         // Check cancellation before project lookup
         cancellationToken.ThrowIfCancellationRequested();
 
-        var project = CurrentSolution.GetProject(projectId);
+        var solution = CurrentSolution;
+        if (solution == null) {
+            _logger.LogWarning("Cannot get compilation: No solution loaded.");
+            return null;
+        }
+
+        var project = solution.GetProject(projectId);
         if (project == null) {
             _logger.LogWarning("Project not found for ID: {ProjectId}", projectId);
             return null;

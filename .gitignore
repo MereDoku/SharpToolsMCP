@@ -62,3 +62,5 @@ DS_Store
 
 publish/
 .clavix/
+.qwen/
+.tools/

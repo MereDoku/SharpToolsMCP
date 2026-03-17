@@ -246,6 +246,10 @@ public class CodeModificationService : ICodeModificationService {
     }
     public async Task<Solution> RenameSymbolAsync(ISymbol symbol, string newName, CancellationToken cancellationToken) {
         var solution = GetCurrentSolutionOrThrow();
+        return await RenameSymbolAsync(solution, symbol, newName, cancellationToken);
+    }
+
+    private async Task<Solution> RenameSymbolAsync(Solution solution, ISymbol symbol, string newName, CancellationToken cancellationToken) {
         _logger.LogInformation("Renaming symbol {SymbolName} to {NewName}", symbol.ToDisplayString(), newName);
 
         var options = solution.Workspace.Options;
@@ -576,6 +580,543 @@ public class CodeModificationService : ICodeModificationService {
         }
 
         return (true, successMessage);
+    }
+
+    public async Task<Solution> ExtractMethodAsync(DocumentId documentId, Microsoft.CodeAnalysis.Text.TextSpan textSpan, string methodName, string visibility, CancellationToken cancellationToken) {
+        var solution = GetCurrentSolutionOrThrow();
+        var document = solution.GetDocument(documentId) ?? throw new ArgumentException($"Document with ID '{documentId}' not found in the current solution.", nameof(documentId));
+
+        _logger.LogInformation("Extracting method {MethodName} with visibility {Visibility} in document {DocumentPath}", methodName, visibility, document.FilePath);
+
+        var requestedAccessibility = ParseAccessibility(visibility);
+        var originalRoot = await document.GetSyntaxRootAsync(cancellationToken) ?? throw new InvalidOperationException("Could not get syntax root for the original document.");
+
+        // The service lives in Microsoft.CodeAnalysis.Features, not in the CSharp.Workspaces assembly.
+        var featuresAssembly = AppDomain.CurrentDomain.GetAssemblies()
+            .FirstOrDefault(a => string.Equals(a.GetName().Name, "Microsoft.CodeAnalysis.Features", StringComparison.Ordinal))
+            ?? System.Reflection.Assembly.Load("Microsoft.CodeAnalysis.Features");
+        var extractMethodServiceType = featuresAssembly.GetType("Microsoft.CodeAnalysis.ExtractMethod.IExtractMethodService");
+
+        if (extractMethodServiceType == null) {
+            throw new InvalidOperationException("IExtractMethodService type not found in Microsoft.CodeAnalysis.Features assembly.");
+        }
+
+        // Use reflection to call the generic GetService<T> method
+        var languageServices = document.Project.Services;
+        var getServiceMethod = languageServices.GetType()
+            .GetMethods()
+            .FirstOrDefault(m => m.Name == "GetService" && m.IsGenericMethod && m.GetParameters().Length == 0);
+        
+        if (getServiceMethod == null) {
+            throw new InvalidOperationException("GetService<T> method not found on HostLanguageServices.");
+        }
+
+        var genericGetService = getServiceMethod.MakeGenericMethod(extractMethodServiceType);
+        var extractMethodService = genericGetService.Invoke(languageServices, null);
+        
+        if (extractMethodService == null) {
+            throw new InvalidOperationException("IExtractMethodService not found for this language.");
+        }
+
+        // Call ExtractMethodAsync(Document, TextSpan, bool, ExtractMethodGenerationOptions, CancellationToken)
+        // Note: The bool parameter might be useMethodBody or similar, usually true.
+        // ExtractMethodGenerationOptions can be null for defaults.
+        var methodInfo = extractMethodServiceType.GetMethod("ExtractMethodAsync");
+        if (methodInfo == null) {
+            throw new InvalidOperationException("ExtractMethodAsync method not found on IExtractMethodService.");
+        }
+
+        try {
+            var generationOptionsType = methodInfo.GetParameters()[3].ParameterType;
+            var generationOptions = CreateExtractMethodGenerationOptions(generationOptionsType, document.Project, methodName);
+            var task = (Task)methodInfo.Invoke(extractMethodService, new object[] { document, textSpan, false, generationOptions, cancellationToken })!;
+            await task.ConfigureAwait(false);
+
+            // Get result via reflection since result type is also likely internal
+            var resultProperty = task.GetType().GetProperty("Result");
+            var result = resultProperty?.GetValue(task);
+            
+            if (result == null) {
+                throw new McpException("ExtractMethodAsync returned null result.");
+            }
+
+            var succeededProperty = result.GetType().GetProperty("Succeeded");
+            bool succeeded = (bool)(succeededProperty?.GetValue(result) ?? false);
+
+            if (!succeeded) {
+                var reasonsProperty = result.GetType().GetProperty("Reasons");
+                var reasons = reasonsProperty?.GetValue(result) as System.Collections.IEnumerable;
+                var reasonText = reasons == null
+                    ? "unknown reason"
+                    : string.Join("; ", reasons.Cast<object>());
+                throw new McpException($"Failed to extract method: {reasonText}");
+            }
+
+            var newDocument = await GetExtractedDocumentAsync(result, cancellationToken);
+
+            var updatedSolution = await RenameAndAdjustExtractedMethodAsync(
+                originalRoot,
+                newDocument,
+                textSpan,
+                methodName,
+                requestedAccessibility,
+                cancellationToken);
+
+            var updatedDocument = updatedSolution.GetDocument(documentId) ?? throw new InvalidOperationException("Updated document not found after method extraction.");
+            var formattedDocument = await FormatDocumentAsync(updatedDocument, cancellationToken);
+            return formattedDocument.Project.Solution;
+        } catch (System.Reflection.TargetInvocationException ex) {
+            throw new McpException($"Error during method extraction: {ex.InnerException?.Message ?? ex.Message}");
+        }
+    }
+
+    private async Task<Solution> RenameAndAdjustExtractedMethodAsync(
+        SyntaxNode originalRoot,
+        Document extractedDocument,
+        TextSpan textSpan,
+        string requestedMethodName,
+        Accessibility requestedAccessibility,
+        CancellationToken cancellationToken) {
+        var updatedSolution = extractedDocument.Project.Solution;
+        var updatedDocument = extractedDocument;
+        var updatedRoot = await updatedDocument.GetSyntaxRootAsync(cancellationToken) ?? throw new InvalidOperationException("Could not get syntax root after method extraction.");
+
+        var extractedMethod = FindExtractedMethod(originalRoot, updatedRoot, textSpan, preferredMethodName: null);
+        if (extractedMethod == null) {
+            throw new InvalidOperationException("Could not identify the extracted method in the updated document.");
+        }
+
+        var semanticModel = await updatedDocument.GetSemanticModelAsync(cancellationToken) ?? throw new InvalidOperationException("Could not get semantic model for extracted method.");
+        var extractedSymbol = semanticModel.GetDeclaredSymbol(extractedMethod, cancellationToken) ?? throw new InvalidOperationException("Could not resolve the extracted method symbol.");
+
+        if (!string.Equals(extractedSymbol.Name, requestedMethodName, StringComparison.Ordinal)) {
+            updatedSolution = await RenameSymbolAsync(updatedSolution, extractedSymbol, requestedMethodName, cancellationToken);
+            updatedDocument = updatedSolution.GetDocument(extractedDocument.Id) ?? throw new InvalidOperationException("Updated document not found after renaming extracted method.");
+            updatedRoot = await updatedDocument.GetSyntaxRootAsync(cancellationToken) ?? throw new InvalidOperationException("Could not get syntax root after renaming extracted method.");
+        }
+
+        extractedMethod = FindExtractedMethod(originalRoot, updatedRoot, textSpan, requestedMethodName);
+        if (extractedMethod == null) {
+            throw new InvalidOperationException($"Could not find extracted method '{requestedMethodName}' after renaming.");
+        }
+
+        var adjustedMethod = ApplyAccessibility(extractedMethod, requestedAccessibility);
+        if (adjustedMethod != extractedMethod) {
+            updatedRoot = updatedRoot.ReplaceNode(extractedMethod, adjustedMethod);
+            updatedDocument = updatedDocument.WithSyntaxRoot(updatedRoot);
+            updatedSolution = updatedDocument.Project.Solution;
+        }
+
+        return updatedSolution;
+    }
+
+    private static async Task<Document> GetExtractedDocumentAsync(object extractMethodResult, CancellationToken cancellationToken) {
+        var getDocumentMethod = extractMethodResult.GetType().GetMethod("GetDocumentAsync")
+            ?? throw new InvalidOperationException($"GetDocumentAsync method not found on extract result type '{extractMethodResult.GetType().FullName}'.");
+
+        var task = (Task)getDocumentMethod.Invoke(extractMethodResult, new object[] { cancellationToken })!;
+        await task.ConfigureAwait(false);
+
+        var taskResult = task.GetType().GetProperty("Result")?.GetValue(task)
+            ?? throw new InvalidOperationException("GetDocumentAsync returned a null result.");
+
+        var tupleType = taskResult.GetType();
+        var documentValue = tupleType.GetField("document")?.GetValue(taskResult)
+            ?? tupleType.GetField("Item1")?.GetValue(taskResult)
+            ?? tupleType.GetProperty("document")?.GetValue(taskResult)
+            ?? tupleType.GetProperty("Item1")?.GetValue(taskResult);
+
+        return documentValue as Document
+            ?? throw new InvalidOperationException($"GetDocumentAsync did not return a Document. Actual value type: '{documentValue?.GetType().FullName ?? "null"}'.");
+    }
+
+    private static object CreateExtractMethodGenerationOptions(Type optionsType, Project project, string methodName) {
+        var defaultFactory = optionsType
+            .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+            .FirstOrDefault(method =>
+                string.Equals(method.Name, "GetDefault", StringComparison.Ordinal) &&
+                method.GetParameters().Length == 1 &&
+                method.GetParameters()[0].ParameterType.IsInstanceOfType(project.Services));
+
+        if (defaultFactory != null) {
+            var defaultOptions = defaultFactory.Invoke(null, new object[] { project.Services });
+            if (defaultOptions != null) {
+                return defaultOptions;
+            }
+        }
+
+        object options = CreateOptionsInstance(optionsType, project, methodName)
+            ?? throw new InvalidOperationException("Could not construct ExtractMethodGenerationOptions.");
+
+        InitializeOptionMembers(options, project, methodName);
+        return options;
+    }
+
+    private static object? CreateOptionsInstance(Type optionsType, Project project, string methodName) {
+        var constructors = optionsType
+            .GetConstructors(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            .OrderBy(ctor => ctor.GetParameters().Count(parameter => !parameter.IsOptional));
+
+        foreach (var constructor in constructors) {
+            var parameters = constructor.GetParameters();
+            var args = new object?[parameters.Length];
+            bool canInvoke = true;
+
+            for (int index = 0; index < parameters.Length; index++) {
+                if (!TryCreateConstructorArgument(parameters[index], project, methodName, out var argumentValue)) {
+                    canInvoke = false;
+                    break;
+                }
+
+                args[index] = argumentValue;
+            }
+
+            if (!canInvoke) {
+                continue;
+            }
+
+            try {
+                return constructor.Invoke(args);
+            } catch {
+                // Try the next constructor shape.
+            }
+        }
+
+        try {
+            return Activator.CreateInstance(optionsType, nonPublic: true);
+        } catch {
+            return null;
+        }
+    }
+
+    private static bool TryCreateConstructorArgument(System.Reflection.ParameterInfo parameter, Project project, string methodName, out object? argumentValue) {
+        if (parameter.ParameterType == typeof(string) && ParameterLooksLikeMethodName(parameter.Name)) {
+            argumentValue = methodName;
+            return true;
+        }
+
+        if (parameter.IsOptional) {
+            argumentValue = parameter.DefaultValue;
+            return true;
+        }
+
+        if (TryCreateMemberValue(parameter.ParameterType, parameter.Name, project, methodName, out argumentValue)) {
+            return true;
+        }
+
+        argumentValue = null;
+        return false;
+    }
+
+    private static void InitializeOptionMembers(object options, Project project, string methodName) {
+        var flags = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+
+        foreach (var property in options.GetType().GetProperties(flags).Where(property => property.CanWrite)) {
+            object? currentValue;
+            try {
+                currentValue = property.GetValue(options);
+            } catch {
+                continue;
+            }
+
+            if (property.PropertyType == typeof(string) && ParameterLooksLikeMethodName(property.Name)) {
+                property.SetValue(options, methodName);
+                continue;
+            }
+
+            if (currentValue != null) {
+                continue;
+            }
+
+            if (TryCreateMemberValue(property.PropertyType, property.Name, project, methodName, out var propertyValue)) {
+                property.SetValue(options, propertyValue);
+            }
+        }
+
+        foreach (var field in options.GetType().GetFields(flags).Where(field => !field.IsInitOnly)) {
+            object? currentValue;
+            try {
+                currentValue = field.GetValue(options);
+            } catch {
+                continue;
+            }
+
+            if (field.FieldType == typeof(string) && ParameterLooksLikeMethodName(field.Name)) {
+                field.SetValue(options, methodName);
+                continue;
+            }
+
+            if (currentValue != null) {
+                continue;
+            }
+
+            if (TryCreateMemberValue(field.FieldType, field.Name, project, methodName, out var fieldValue)) {
+                field.SetValue(options, fieldValue);
+            }
+        }
+    }
+
+    private static bool TryCreateMemberValue(Type memberType, string? memberName, Project project, string methodName, out object? value) {
+        if (memberType == typeof(string) && ParameterLooksLikeMethodName(memberName)) {
+            value = methodName;
+            return true;
+        }
+
+        if (memberType == typeof(bool)) {
+            value = false;
+            return true;
+        }
+
+        if (memberType.IsEnum) {
+            value = Activator.CreateInstance(memberType);
+            return true;
+        }
+
+        if (memberType.IsValueType) {
+            value = Activator.CreateInstance(memberType);
+            return true;
+        }
+
+        if (memberType.FullName?.Contains("CodeGenerationOptions", StringComparison.Ordinal) == true &&
+            TryCreateCodeGenerationOptions(memberType, project, out value)) {
+            if (value != null) {
+                InitializeOptionMembers(value, project, methodName);
+            }
+            return true;
+        }
+
+        if (HasAccessibleParameterlessConstructor(memberType)) {
+            value = Activator.CreateInstance(memberType, nonPublic: true);
+            if (value != null) {
+                InitializeOptionMembers(value, project, methodName);
+            }
+            return true;
+        }
+
+        value = null;
+        return false;
+    }
+
+    private static bool TryCreateCodeGenerationOptions(Type codeGenerationOptionsType, Project project, out object? value) {
+        var candidateMethods = codeGenerationOptionsType
+            .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+            .Where(method => string.Equals(method.Name, "GetDefault", StringComparison.Ordinal) ||
+                             string.Equals(method.Name, "CreateDefault", StringComparison.Ordinal));
+
+        foreach (var method in candidateMethods.OrderBy(method => method.GetParameters().Length)) {
+            var parameters = method.GetParameters();
+            var args = new object?[parameters.Length];
+            bool canInvoke = true;
+
+            for (int index = 0; index < parameters.Length; index++) {
+                var parameterType = parameters[index].ParameterType;
+
+                if (parameterType.IsInstanceOfType(project.Services)) {
+                    args[index] = project.Services;
+                } else if (parameterType == typeof(string)) {
+                    args[index] = project.Language;
+                } else if (parameters[index].IsOptional) {
+                    args[index] = parameters[index].DefaultValue;
+                } else {
+                    canInvoke = false;
+                    break;
+                }
+            }
+
+            if (!canInvoke) {
+                continue;
+            }
+
+            try {
+                value = method.Invoke(null, args);
+                if (value != null && codeGenerationOptionsType.IsInstanceOfType(value)) {
+                    return true;
+                }
+
+                if (value != null && TryAdaptCodeGenerationOptions(codeGenerationOptionsType, value, out var adaptedValue)) {
+                    value = adaptedValue;
+                    return true;
+                }
+            } catch {
+                // Try the next factory shape.
+            }
+        }
+
+        try {
+            value = Activator.CreateInstance(codeGenerationOptionsType, nonPublic: true);
+            return value != null;
+        } catch {
+            value = null;
+            return false;
+        }
+    }
+
+    private static bool TryAdaptCodeGenerationOptions(Type targetType, object sourceValue, out object? adaptedValue) {
+        var compatibleConstructor = targetType
+            .GetConstructors(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            .Select(constructor => new {
+                Constructor = constructor,
+                Parameters = constructor.GetParameters()
+            })
+            .FirstOrDefault(candidate =>
+                candidate.Parameters.Length == 1 &&
+                candidate.Parameters[0].ParameterType.IsInstanceOfType(sourceValue));
+
+        if (compatibleConstructor == null) {
+            adaptedValue = null;
+            return false;
+        }
+
+        try {
+            adaptedValue = compatibleConstructor.Constructor.Invoke(new[] { sourceValue });
+            return adaptedValue != null;
+        } catch {
+            adaptedValue = null;
+            return false;
+        }
+    }
+
+    private static bool HasAccessibleParameterlessConstructor(Type type) =>
+        type.GetConstructor(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance, null, Type.EmptyTypes, null) != null;
+
+    private static bool ParameterLooksLikeMethodName(string? memberName) =>
+        !string.IsNullOrWhiteSpace(memberName) &&
+        (memberName.Contains("methodname", StringComparison.OrdinalIgnoreCase) ||
+         memberName.Contains("preferredname", StringComparison.OrdinalIgnoreCase) ||
+         memberName.Contains("nameofextract", StringComparison.OrdinalIgnoreCase));
+
+    private static MethodDeclarationSyntax? FindExtractedMethod(
+        SyntaxNode originalRoot,
+        SyntaxNode updatedRoot,
+        TextSpan textSpan,
+        string? preferredMethodName) {
+        var originalContainingType = originalRoot.FindNode(textSpan).AncestorsAndSelf().OfType<TypeDeclarationSyntax>().FirstOrDefault();
+        var updatedContainingType = FindMatchingTypeDeclaration(updatedRoot, originalContainingType);
+
+        if (originalContainingType == null || updatedContainingType == null) {
+            return null;
+        }
+
+        var originalContainingMethod = originalRoot.FindNode(textSpan).AncestorsAndSelf().OfType<MethodDeclarationSyntax>().FirstOrDefault();
+        var originalMethods = originalContainingType.Members.OfType<MethodDeclarationSyntax>().ToList();
+
+        var candidates = updatedContainingType.Members
+            .OfType<MethodDeclarationSyntax>()
+            .Where(method => !MatchesMethodSignature(method, originalContainingMethod))
+            .Where(method => !originalMethods.Any(existingMethod => MatchesMethodSignature(method, existingMethod)))
+            .ToList();
+
+        if (!string.IsNullOrWhiteSpace(preferredMethodName)) {
+            var preferredCandidate = candidates.FirstOrDefault(method => string.Equals(method.Identifier.ValueText, preferredMethodName, StringComparison.Ordinal));
+            if (preferredCandidate != null) {
+                return preferredCandidate;
+            }
+        }
+
+        if (candidates.Count == 1) {
+            return candidates[0];
+        }
+
+        return candidates
+            .OrderByDescending(method => method.Identifier.ValueText.StartsWith("NewMethod", StringComparison.Ordinal))
+            .ThenByDescending(method => method.SpanStart)
+            .FirstOrDefault();
+    }
+
+    private static TypeDeclarationSyntax? FindMatchingTypeDeclaration(SyntaxNode updatedRoot, TypeDeclarationSyntax? originalContainingType) {
+        if (originalContainingType == null) {
+            return null;
+        }
+
+        var typePath = originalContainingType.AncestorsAndSelf()
+            .OfType<TypeDeclarationSyntax>()
+            .Select(type => type.Identifier.ValueText)
+            .Reverse()
+            .ToArray();
+
+        return updatedRoot.DescendantNodes()
+            .OfType<TypeDeclarationSyntax>()
+            .FirstOrDefault(type =>
+                type.AncestorsAndSelf()
+                    .OfType<TypeDeclarationSyntax>()
+                    .Select(candidate => candidate.Identifier.ValueText)
+                    .Reverse()
+                    .SequenceEqual(typePath));
+    }
+
+    private static bool MatchesMethodSignature(MethodDeclarationSyntax? left, MethodDeclarationSyntax? right) {
+        if (left == null || right == null) {
+            return false;
+        }
+
+        if (!string.Equals(left.Identifier.ValueText, right.Identifier.ValueText, StringComparison.Ordinal)) {
+            return false;
+        }
+
+        if (!string.Equals(left.ReturnType.ToString(), right.ReturnType.ToString(), StringComparison.Ordinal)) {
+            return false;
+        }
+
+        if (left.ParameterList.Parameters.Count != right.ParameterList.Parameters.Count) {
+            return false;
+        }
+
+        for (int i = 0; i < left.ParameterList.Parameters.Count; i++) {
+            var leftParameter = left.ParameterList.Parameters[i];
+            var rightParameter = right.ParameterList.Parameters[i];
+
+            if (!string.Equals(leftParameter.Type?.ToString(), rightParameter.Type?.ToString(), StringComparison.Ordinal)) {
+                return false;
+            }
+
+            if (!string.Equals(leftParameter.Modifiers.ToString(), rightParameter.Modifiers.ToString(), StringComparison.Ordinal)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static Accessibility ParseAccessibility(string visibility) {
+        var normalizedVisibility = Regex.Replace(visibility.Trim(), "\\s+", " ").ToLowerInvariant();
+
+        return normalizedVisibility switch {
+            "private" => Accessibility.Private,
+            "public" => Accessibility.Public,
+            "internal" => Accessibility.Internal,
+            "protected" => Accessibility.Protected,
+            "protected internal" => Accessibility.ProtectedOrInternal,
+            "private protected" => Accessibility.ProtectedAndInternal,
+            _ => throw new ArgumentException($"Unsupported method visibility '{visibility}'.", nameof(visibility))
+        };
+    }
+
+    private static MethodDeclarationSyntax ApplyAccessibility(MethodDeclarationSyntax methodDeclaration, Accessibility accessibility) {
+        var nonAccessibilityModifiers = methodDeclaration.Modifiers
+            .Where(modifier =>
+                !modifier.IsKind(SyntaxKind.PublicKeyword) &&
+                !modifier.IsKind(SyntaxKind.PrivateKeyword) &&
+                !modifier.IsKind(SyntaxKind.ProtectedKeyword) &&
+                !modifier.IsKind(SyntaxKind.InternalKeyword))
+            .ToArray();
+
+        var accessibilityModifiers = accessibility switch {
+            Accessibility.Public => new[] { SyntaxFactory.Token(SyntaxKind.PublicKeyword) },
+            Accessibility.Private => new[] { SyntaxFactory.Token(SyntaxKind.PrivateKeyword) },
+            Accessibility.Internal => new[] { SyntaxFactory.Token(SyntaxKind.InternalKeyword) },
+            Accessibility.Protected => new[] { SyntaxFactory.Token(SyntaxKind.ProtectedKeyword) },
+            Accessibility.ProtectedOrInternal => new[] {
+                SyntaxFactory.Token(SyntaxKind.ProtectedKeyword),
+                SyntaxFactory.Token(SyntaxKind.InternalKeyword)
+            },
+            Accessibility.ProtectedAndInternal => new[] {
+                SyntaxFactory.Token(SyntaxKind.PrivateKeyword),
+                SyntaxFactory.Token(SyntaxKind.ProtectedKeyword)
+            },
+            _ => throw new ArgumentOutOfRangeException(nameof(accessibility), accessibility, "Unsupported accessibility for extracted method.")
+        };
+
+        return methodDeclaration.WithModifiers(SyntaxFactory.TokenList(accessibilityModifiers.Concat(nonAccessibilityModifiers)));
     }
 }
 

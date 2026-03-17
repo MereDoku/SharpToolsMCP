@@ -5,6 +5,7 @@ public interface ICodeModificationService {
     Task<Solution> ReplaceNodeAsync(DocumentId documentId, SyntaxNode oldNode, SyntaxNode newNode, CancellationToken cancellationToken);
     Task<Solution> RenameSymbolAsync(ISymbol symbol, string newName, CancellationToken cancellationToken);
     Task<Solution> ReplaceAllReferencesAsync(ISymbol symbol, string replacementText, CancellationToken cancellationToken, Func<SyntaxNode, bool>? predicateFilter = null);
+    Task<Solution> ExtractMethodAsync(DocumentId documentId, Microsoft.CodeAnalysis.Text.TextSpan textSpan, string methodName, string visibility, CancellationToken cancellationToken);
     Task<Document> FormatDocumentAsync(Document document, CancellationToken cancellationToken);
     Task ApplyChangesAsync(Solution newSolution, CancellationToken cancellationToken, string commitMessage, IEnumerable<string>? additionalFilePaths = null);
 

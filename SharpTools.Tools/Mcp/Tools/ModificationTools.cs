@@ -834,6 +834,99 @@ public static class ModificationTools {
             }
         }, logger, nameof(FindAndReplace), cancellationToken);
     }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ExtractMethod), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
+    [Description("Extracts a selection of code into a new method. The selection is replaced with a call to the new method. This is perfect for improving code readability and reusability.")]
+    public static async Task<string> ExtractMethod(
+        ISolutionManager solutionManager,
+        ICodeModificationService modificationService,
+        ILogger<ModificationToolsLogCategory> logger,
+        [Description("Path to the source file.")] string sourceFile,
+        [Description("The starting line of the code to extract.")] int startLine,
+        [Description("The starting column of the code to extract.")] int startColumn,
+        [Description("The ending line of the code to extract.")] int endLine,
+        [Description("The ending column of the code to extract.")] int endColumn,
+        [Description("The name for the new method.")] string methodName,
+        [Description("The visibility of the new method (e.g., private, public). Defaults to private.")] string visibility = "private",
+        [Description("If true, returns the changes that would be made without applying them.")] bool preview = false,
+        string commitMessage = "Extract method",
+        CancellationToken cancellationToken = default) {
+
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // Validate parameters
+            ErrorHandlingHelpers.ValidateStringParameter(sourceFile, nameof(sourceFile), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(methodName, nameof(methodName), logger);
+
+            // Ensure solution is loaded
+            ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(ExtractMethod));
+            logger.LogInformation("Executing '{ExtractMethod}' in {SourceFile} at {StartLine}:{StartColumn} to {EndLine}:{EndColumn}",
+                nameof(ExtractMethod), sourceFile, startLine, startColumn, endLine, endColumn);
+
+            if (solutionManager.CurrentSolution == null) {
+                throw new McpException("Current solution is unexpectedly null.");
+            }
+
+            // Find the document
+            var document = solutionManager.CurrentSolution.Projects
+                .SelectMany(p => p.Documents)
+                .FirstOrDefault(d => d.FilePath != null && d.FilePath.Replace("\\", "/").EndsWith(sourceFile.Replace("\\", "/"), StringComparison.OrdinalIgnoreCase));
+
+            if (document == null) {
+                throw new McpException($"Document '{sourceFile}' not found in the solution.");
+            }
+
+            // Convert coordinates to TextSpan
+            var text = await document.GetTextAsync(cancellationToken);
+            int startPos, endPos;
+            try {
+                startPos = text.Lines.GetPosition(new Microsoft.CodeAnalysis.Text.LinePosition(startLine - 1, startColumn - 1));
+                endPos = text.Lines.GetPosition(new Microsoft.CodeAnalysis.Text.LinePosition(endLine - 1, endColumn - 1));
+            } catch (ArgumentOutOfRangeException ex) {
+                throw new McpException($"Invalid coordinates: {ex.Message}");
+            }
+
+            var textSpan = Microsoft.CodeAnalysis.Text.TextSpan.FromBounds(startPos, endPos);
+
+            try {
+                // Perform extraction
+                var newSolution = await modificationService.ExtractMethodAsync(document.Id, textSpan, methodName, visibility, cancellationToken);
+
+                // Find the original and new document to generate diff
+                var oldDocument = solutionManager.CurrentSolution.GetDocument(document.Id)!;
+                var newDocument = newSolution.GetDocument(document.Id)!;
+
+                var oldRoot = await oldDocument.GetSyntaxRootAsync(cancellationToken);
+                var newRoot = await newDocument.GetSyntaxRootAsync(cancellationToken);
+
+                // Generate diff
+                string diffOutput = ContextInjectors.CreateCodeDiff(oldRoot?.ToFullString() ?? "", newRoot?.ToFullString() ?? "");
+
+                if (preview) {
+                    return $"Preview of method extraction into '{methodName}':\n\n{diffOutput}";
+                }
+
+                // Apply changes
+                string finalCommitMessage = $"Extract method {methodName} in {sourceFile}: " + commitMessage;
+                await modificationService.ApplyChangesAsync(newSolution, cancellationToken, finalCommitMessage);
+
+                // Check for compilation errors
+                var updatedDocument = solutionManager.CurrentSolution.GetDocument(document.Id);
+                string errorMessages = "";
+                if (updatedDocument != null) {
+                    var (hasErrors, checkResult) = await ContextInjectors.CheckCompilationErrorsAsync(
+                        solutionManager, updatedDocument, logger, cancellationToken);
+                    errorMessages = hasErrors ? checkResult : "<errorCheck>No compilation issues detected.</errorCheck>";
+                }
+
+                return $"Successfully extracted code into method '{methodName}' in {sourceFile}.\n\n{diffOutput}\n\n{errorMessages}";
+
+            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
+                logger.LogError(ex, "Failed to extract method in {SourceFile}", sourceFile);
+                throw new McpException($"Failed to extract method: {ex.Message}");
+            }
+        }, logger, nameof(ExtractMethod), cancellationToken);
+    }
+
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(MoveMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
     [Description("Moves a member (property, field, method, nested type, etc.) from one type/namespace to another. The member is removed from the source location and added to the destination.")]
     public static async Task<string> MoveMember(
